@@ -31,9 +31,14 @@ syntax = {
     'src_extension': ' SRC.mcfunction',
     'dest_extension': '.mcfunction',
     'directive_prefix': '##',
+    'embed_open': '%(',
+    'embed_close': ')',
 }
 
 cache_version = 1
+
+def re_union(*patterns : re.Pattern):
+    return '|'.join(compiled_pattern.pattern for compiled_pattern in patterns)
 
 def normalize_path(path):
     return path.replace('\\', '/')
@@ -82,13 +87,19 @@ class ParserError(Exception):
 class Symbol:
     def __init__(self, name : str) -> None:
         self.name = name
+    
+    def invoke(self, args : list) -> str:
+        raise ParserError(f"Cannot invoke a {type(self).__name__} with parameters, but got parameters: {repr(args)}")
+
+    def insert(self) -> str:
+        raise ParserError(f"Cannot insert a {type(self).__name__} without parameters, but no parameters were given.")
 
 class SymbolArg(Symbol):
     def __init__(self, name: str) -> None:
         super().__init__(name)
         self.value = None
 
-class SymbolMacro(Symbol):
+class SymbolMacro(Symbol): # TODO: Delete.
     def __init__(self, name: str, argnames: list[str], parent_scope: 'Scope') -> None:
         super().__init__(name)
         self.argnames = argnames
@@ -104,6 +115,38 @@ class SymbolMacro(Symbol):
         for command in self.scope.code:
             command.output(self.scope, lines)
 
+class SymbolVariable(Symbol):
+    def __init__(self, value : str) -> None:
+        self.value = value
+
+    def evaluate(self) -> str:
+        return self.value
+
+class SymbolTemplate(Symbol):
+    def __init__(self, parent_scope : 'Scope', argnames : list[str], commands : list['Command']) -> None:
+        self.parent_scope
+        self.argnames = argnames
+        self.commands = commands
+
+    def insert(self):
+        return self
+
+    def invoke(self, args: list):
+        if len(args) != len(self.argnames):
+            raise ParserError(f"Template {self.name} expected {len(self.argnames)} arguments, but got {len(args)}: {repr(args)}")
+        
+        inner_scope = Scope(self.parent_scope)
+        for i, argname in enumerate(self.argnames):
+            arg = args[i]
+            if isinstance(arg, str):
+                arg = SymbolVariable(arg)
+            inner_scope.add_symbol(argname, arg)
+
+        inner_lines = []
+        for command in self.commands:
+            command.output(inner_scope, inner_lines)
+        return '\n'.join(inner_lines)
+
 class SymbolFunction(Symbol):
     def __init__(self, name: str, parent_scope: 'Scope', parent_unit : CompilationUnit) -> None:
         super().__init__(name)
@@ -114,6 +157,9 @@ class SymbolFunction(Symbol):
 
     def mcfunction_id(self):
         return f'{self.compilation_unit.namespace}:{self.compilation_unit.id}'
+    
+    def insert(self):
+        return self.mcfunction_id()
 
 class Scope:
     def __init__(self, parent : 'Scope' = None) -> None:
@@ -121,10 +167,10 @@ class Scope:
         self.symbols : dict[str, Symbol] = dict()
         self.code : list[Command] = []
     
-    def add_symbol(self, symbol : Symbol):
-        if self.get_symbol(symbol.name):
-            raise ParserError(f"Can't define symbol '{symbol.name}'; it's already been defined.")
-        self.symbols[symbol.name] = symbol
+    def add_symbol(self, name : str, symbol : Symbol):
+        if self.get_symbol(name):
+            raise ParserError(f"Can't define symbol '{name}'; it's already been defined.")
+        self.symbols[name] = symbol
 
     def get_symbol(self, name):
         if name in self.symbols:
@@ -134,13 +180,19 @@ class Scope:
         else:
             return None
     
-    def all_symbols(self) -> list[Symbol]:
-        result = [symbol for symbol in self.symbols.values()]
+    def all_symbols(self) -> dict[str, Symbol]:
+        result = self.symbols.copy()
         if self.parent != None:
-            result += self.parent.all_symbols()
+            result = dict(result, **(self.parent.all_symbols()))
         return result;
 
-pattern_name = re.compile(r'[A-Z][A-Z0-9_]*')
+
+#################################################
+#                    Parsing                    #
+#################################################
+
+
+pattern_name = re.compile(r'[A-Za-z][A-Za-z0-9_]*')
 pattern_string = re.compile(r'"(?:[^"\r\n]|\\")*"')
 pattern_any_whitespace = re.compile(r'[^\S\r\n]*')
 pattern_lparen  = re.compile(r'\(')
@@ -149,6 +201,11 @@ pattern_rcurly  = re.compile(r'\}')
 pattern_rsquare = re.compile(r'\]')
 pattern_comma   = re.compile(r'\,')
 pattern_colon   = re.compile(r'\:')
+pattern_directive_prefix = re.compile(f"{re.escape(syntax['directive_prefix'])}")
+pattern_embed_escape = re.compile(r'\\')
+pattern_embed_open         = re.compile(f"{re.escape(syntax['embed_open'])}")
+pattern_embed_close        = re.compile(f"{re.escape(syntax['embed_close'])}")
+pattern_not_newline        = re.compile(f".")
 
 class Parser:
     def __init__(self, text : str) -> None:
@@ -276,16 +333,99 @@ def parse_sequence(parser : Parser, parse_item : Callable[[Parser], any], patter
             break
     return result
 
+class Embed():
+    @staticmethod
+    def parse(parser : Parser) -> 'Embed':
+        parser.expect(pattern_embed_open)
+        name = Code.parse(parser, re_union(pattern_embed_close, pattern_colon))
+
+        result : Embed
+        if parser.allow(pattern_colon):
+            pattern_terminator = re_union(pattern_embed_close, pattern_comma)
+            args = parse_sequence(parser, lambda p: Code.parse(p, pattern_terminator), pattern_comma)
+            result = Invocation(name, args)
+        else:
+            result = Insertion(name)
+        
+        parser.expect(pattern_embed_close)
+
+        return result
+    
+    def evaluate(self, scope : Scope) -> str:
+        raise NotImplementedError()
+
+class Insertion(Embed):
+    def __init__(self, name : 'Code') -> None:
+        super().__init__()
+        self.name = name
+
+    def evaluate(self, scope: Scope) -> str:
+        name = self.name.evaluate(scope)
+        symbol = scope.get_symbol(name)
+        return symbol.insert()
+
+class Invocation(Embed):
+    def __init__(self, name : 'Code', args : list['Code']) -> None:
+        super().__init__()
+        self.name = name
+        self.args = args
+    
+    def evaluate(self, scope: Scope) -> str:
+        name = self.name.evaluate(scope)
+        symbol = scope.get_symbol(name)
+        args = [arg.evaluate(scope) for arg in self.args]
+        return symbol.invoke(args)
+
+class Code(list):
+    @staticmethod
+    def parse(parser : Parser, pattern_terminator : re.Pattern = None):
+        result = Code()
+        current_str = ''
+        while parser.any():
+            if pattern_terminator and parser.peek(pattern_terminator):
+                break
+            elif escape := parser.allow(pattern_embed_escape, strict=True):
+                current_str += escape
+                # Permit ONE protected token to follow the escape character.
+                if text := parser.allow(pattern_embed_open, strict=True):
+                    current_str += text
+                elif text := parser.allow(pattern_embed_close, strict=True):
+                    current_str += text
+            elif parser.peek(pattern_embed_open, strict=True):
+                if current_str:
+                    result.append(current_str)
+                    current_str = ''
+                
+                result.append(Embed.parse(parser))
+            else:
+                current_str += parser.expect(pattern_not_newline, strict=True)
+        
+        if current_str:
+            result.append(current_str)
+            current_str = ''
+        
+        return result
+
+    def evaluate(self, scope : Scope) -> str:
+        result = ''
+        for item in self:
+            if isinstance(item, str):
+                result += item
+            elif isinstance(item, Embed):
+                result += item.evaluate(scope)
+            else:
+                raise RuntimeError(f"Code must contain only strs or Embeds, but contains: {repr(item)}")
+
 class Command:
     def output(self, scope : Scope, lines : list[str]):
-        pass
+        raise NotImplementedError()
 
 class CommandPlaintext(Command):
-    def __init__(self, text : str) -> None:
-        self.text = text
+    def __init__(self, code : Code) -> None:
+        self.code = code
     
     def output(self, scope : Scope, lines : list[str]):
-        lines.append(replace_symbols(scope, self.text))
+        lines.append(self.code.evaluate(scope))
 
 class CommandComment(Command):
     def __init__(self, text : str) -> None:
@@ -295,80 +435,92 @@ class CommandComment(Command):
         lines.append(self.text)
 
 class CommandDefine(Command):
-    def __init__(self, compilation_unit : CompilationUnit, lineparser : FileParser, scope : Scope, parser : Parser) -> None:
+    def __init__(self, lineparser : FileParser, parser : Parser) -> None:
         global pattern_name
         global pattern_lparen
         global pattern_rparen
         global pattern_comma
         global pattern_any_whitespace
 
-        name = parser.expect(pattern_name)
-        arg_names = []
+        self.name = parser.expect(pattern_name)
+
+        self.arg_names = None
         if parser.allow(pattern_lparen):
-            arg_names = parse_sequence(parser, lambda prsr: prsr.expect(pattern_name), pattern_comma)
+            self.arg_names = parse_sequence(parser, lambda prsr: prsr.expect(pattern_name), pattern_comma)
             parser.expect(pattern_rparen)
 
-        symbol = SymbolMacro(name, arg_names, scope)
-        parser.allow(pattern_any_whitespace, True)
+        self.code = None
+        self.commands = None
+        parser.allow(pattern_any_whitespace, strict=True)
         if parser.any(): # Symbol is defined in 1 line:
-            symbol.scope.code.append(CommandPlaintext(parse_expr(parser)))
+            self.code = Code.parse(parser)
         else: # No inline definition:
-            parse_block(compilation_unit, lineparser, symbol.scope)
-        scope.add_symbol(symbol)
-
-class CommandInsert(Command):
-    def __init__(self, scope : Scope, parser : Parser) -> None:
-        global pattern_name
-        global pattern_lparen
-        global pattern_rparen
-        global pattern_comma
-
-        name = parser.expect(pattern_name)
-        self.arg_values = []
-        if parser.allow(pattern_lparen):
-            self.arg_values = parse_sequence(parser, parse_expr, pattern_comma)
-            parser.expect(pattern_rparen)
-
-        symbol = scope.get_symbol(name)
-        if symbol==None:
-            raise ParserError(f"Used symbol '{name}', but it hasn't been defined yet!")
-        if not isinstance(symbol, SymbolMacro):
-            raise ParserError(f"Inserted symbol '{name}' must be a macro defined with {syntax['directive_prefix']}define.")
-        self.symbol = symbol
+            self.commands = parse_block(lineparser)
     
     def output(self, scope : Scope, lines : list[str]):
-        self.symbol.output(lines, self.arg_values)
+        symbol : Symbol
+        if self.arg_names is None:
+            # Define a variable. Variables are evaluated now, when they are defined.
+            value : str
+            if self.code:
+                value = self.code.evaluate(scope)
+            else:
+                assert self.commands is not None
+
+                inner_lines : list[str] = []
+                for command in self.commands:
+                    command.output(scope, inner_lines)
+                value = '\n'.join(inner_lines)
+            symbol = SymbolVariable(value)
+        else:
+            # Define a template. Templates are evaluated later, when they are invoked.
+            commands : list[Command]
+            if self.code:
+                commands = [CommandPlaintext(self.code)]
+            else:
+                assert self.commands is not None
+                commands = self.commands
+            symbol = SymbolTemplate(scope, self.arg_names, commands)
+        
+        scope.add_symbol(self.name, symbol)
 
 class CommandBlock(Command):
     do_not_inline = True
 
     def __init__(self, compilation_unit : CompilationUnit, lineparser : FileParser, scope : Scope, parser : Parser) -> None:
         self.condition_command = lineparser.next().strip(' \r\n\t')
-        if not self.condition_command.startswith('execute '):
+        if not self.condition_command.removeprefix('$').startswith('execute '):
             raise ParserError(f"The line following a {syntax['directive_prefix']}block must be a stub 'execute' command.")
         self.scope = Scope(scope)
+        self.scope.code = parse_block(lineparser)
         
+        
+    
+    def output(self, scope: Scope, lines: list[str]):
         if CommandBlock.do_not_inline:
             self.compilation_unit = compilation_unit.make_child()
-            parse_block(self.compilation_unit, lineparser, self.scope)
 
         else:
-            parse_block(compilation_unit, lineparser, self.scope)
-
             # Prepend this block's condition to each command in the block. In other words, "inline" the block.
             for command in self.scope.code:
                 if isinstance(command, CommandPlaintext):
-                    line = command.text
+                    line = command.code.evaluate(scope)
                     line = line.lstrip(' \r\n\t')
                     if not line.startswith('#'):
+                        condition = self.condition_command
                         if line.startswith('execute'):
                             line = line.removeprefix('execute')
                         else:
                             line = f' run {line}'
-                        line = self.condition_command + line
-                    command.text = line
-    
-    def output(self, scope: Scope, lines: list[str]):
+
+                        if line.startswith('$'): # Macro line
+                            line = line.removeprefix('$')
+                            if not condition.startswith('$'):
+                                condition = '$' + condition
+
+                        line = condition + line
+                    command.code = Code([line])
+
         inner_lines = []
         for command in self.scope.code:
             command.output(self.scope, inner_lines)
@@ -377,7 +529,7 @@ class CommandBlock(Command):
         if CommandBlock.do_not_inline:
             write_output_file(inner_lines, compilation_unit_instance.path)
             CommandPlaintext(
-                f'{self.condition_command} run function {compilation_unit_instance.namespace}:{compilation_unit_instance.id}\n'
+                Code([ f'{self.condition_command} run function {compilation_unit_instance.namespace}:{compilation_unit_instance.id}\n' ])
             ).output(scope, lines)
         
         else:
@@ -392,7 +544,7 @@ class CommandFunction(Command):
 
         self.func = SymbolFunction(name, scope, compilation_unit)
         parse_block(self.func.compilation_unit, lineparser, self.func.scope)
-        scope.add_symbol(self.func)
+        scope.add_symbol(name, self.func)
 
     def output(self, scope: Scope, lines: list[str]):
         inner_lines = []
@@ -409,7 +561,7 @@ class CommandImport(Command):
         name = parser.expect(re.compile(r'[^\r\n]+'))
         (imported_compilation_unit, imported_scope) = get_processed_file((namespace, name))
         imported_compilation_unit.dependents.add(compilation_unit)
-        for symbol in imported_scope.all_symbols():
+        for name, symbol in imported_scope.all_symbols().items():
             try:
                 scope.add_symbol(symbol)
             except ParserError as e:
@@ -422,7 +574,7 @@ def replace_symbols(scope : Scope, line : str) -> str:
     global pattern_lparen
     global pattern_comma
 
-    symbols = scope.all_symbols()
+    symbols = scope.all_symbols().values()
     symbols.sort(key = lambda symbol: len(symbol.name), reverse=True)
     while True:
         for symbol in symbols:
@@ -460,21 +612,16 @@ def replace_symbols(scope : Scope, line : str) -> str:
             break
     return line
 
-def parse_command(compilation_unit : CompilationUnit, fileparser : FileParser, scope : Scope) -> Command:
-    'Returns True if the parsed line is a ##end directive, or False otherwise.'
+def parse_command(fileparser : FileParser) -> Command:
     line = fileparser.next()
 
     normalized_line = line.lstrip(' \r\n\t')
-    if normalized_line.startswith(syntax['directive_prefix']): # Is preprocessor directive:
-        directive = normalized_line.removeprefix(syntax['directive_prefix']).removesuffix('\n')
-        opcode = re.match(re.compile(r'\S*'), directive)[0]
-        operand = directive.removeprefix(opcode).lstrip(' \r\n\t')
-        parser = Parser(operand)
-
+    parser = Parser(normalized_line)
+    if parser.allow(pattern_directive_prefix): # Is preprocessor directive:
+        opcode = parser.expect(pattern_name, strict=True)
+        
         if opcode=='define':
-            return CommandDefine(compilation_unit, fileparser, scope, parser)
-        elif opcode=='insert':
-            return CommandInsert(scope, parser)
+            return CommandDefine(fileparser, parser)
         elif opcode=='block':
             return CommandBlock(compilation_unit, fileparser, scope, parser)
         elif opcode=='function':
@@ -488,14 +635,19 @@ def parse_command(compilation_unit : CompilationUnit, fileparser : FileParser, s
     elif normalized_line.startswith('#'):
         return CommandComment(normalized_line)
     else:
-        return CommandPlaintext(normalized_line)
+        return CommandPlaintext(Code.parse(parser))
 
-def parse_block(compilation_unit : CompilationUnit, lineparser : FileParser, scope : Scope):
+def parse_block(lineparser : FileParser) -> list[Command]:
+    result = []
     while lineparser.any():
-        command = parse_command(compilation_unit, lineparser, scope)
-        scope.code.append(command)
+        command = parse_command(lineparser)
         if isinstance(command, CommandEnd):
             break
+        result.append(command)
+    else:
+        raise ParserError(f"Expected closing {syntax['directive_prefix']}end, but found end-of-file.")
+
+    return result
 
 
 
@@ -536,7 +688,9 @@ def get_processed_file(id : tuple[str]):
 
         global_scope = Scope()
         try:
-            parse_block(compilation_unit, lineparser, global_scope)
+            commands = []
+            while lineparser.any():
+                commands.append(parse_command(lineparser))
         except ParserError as err:
             log_error(lineparser, None, err)
         
