@@ -2,6 +2,7 @@ import re
 import os
 import sys
 import json
+import argparse
 from typing import Callable
 
 
@@ -26,6 +27,11 @@ python turbo_preprocess.py <input_path>
 # Clean output files for a compilation unit before outputting them. This prevents obsolete output files from persisting if they aren't overwritten.
 # Maybe automatically clean output files for sources that no longer exist.
 
+syntax = {
+    'src_extension': ' SRC.mcfunction',
+    'dest_extension': '.mcfunction',
+    'directive_prefix': '##',
+}
 
 def path_to_id(path):
     path = path.replace('\\', '/')
@@ -48,13 +54,13 @@ class CompilationUnit:
             name = str(self.anonymous_child_count)
             self.anonymous_child_count += 1
         # Create a unique path for this new function.
-        path = self.path.removesuffix('.mcfunction')
+        path = self.path.removesuffix(syntax['dest_extension'])
         # If the parent unit has no parent (it is top-level), put the new child unit in a __turbo folder alongside the parent unit.
         # Otherwise, put it in the same directory as the parent.
         if not self.parent:
             head, tail = os.path.split(path)
             path = f'{head}/__turbo/{tail}'
-        path += f'_{name}.mcfunction'
+        path += f'_{name}{syntax["dest_extension"]}'
         return CompilationUnit(path, parent=self)
 
 class ParserError(Exception):
@@ -320,7 +326,7 @@ class CommandInsert(Command):
         if symbol==None:
             raise ParserError(f"Used symbol '{name}', but it hasn't been defined yet!")
         if not isinstance(symbol, SymbolMacro):
-            raise ParserError(f"Inserted symbol '{name}' must be a macro defined with ##define.")
+            raise ParserError(f"Inserted symbol '{name}' must be a macro defined with {syntax['directive_prefix']}define.")
         self.symbol = symbol
     
     def output(self, scope : Scope, lines : list[str]):
@@ -332,7 +338,7 @@ class CommandBlock(Command):
     def __init__(self, compilation_unit : CompilationUnit, lineparser : FileParser, scope : Scope, parser : Parser) -> None:
         self.condition_command = lineparser.next().strip(' \r\n\t')
         if not self.condition_command.startswith('execute '):
-            raise ParserError(f"The line following a ##block must be a stub 'execute' command.")
+            raise ParserError(f"The line following a {syntax['directive_prefix']}block must be a stub 'execute' command.")
         self.scope = Scope(scope)
         
         if CommandBlock.do_not_inline:
@@ -451,9 +457,8 @@ def parse_command(compilation_unit : CompilationUnit, fileparser : FileParser, s
     line = fileparser.next()
 
     normalized_line = line.lstrip(' \r\n\t')
-    pattern_directive = re.compile(r'^##[^#]')
-    if pattern_directive.search(normalized_line): # Is preprocessor directive:
-        directive = normalized_line.removeprefix('##').removesuffix('\n')
+    if normalized_line.startswith(syntax['directive_prefix']): # Is preprocessor directive:
+        directive = normalized_line.removeprefix(syntax['directive_prefix']).removesuffix('\n')
         opcode = re.match(re.compile(r'\S*'), directive)[0]
         operand = directive.removeprefix(opcode).lstrip(' \r\n\t')
         parser = Parser(operand)
@@ -510,8 +515,8 @@ def get_processed_file(id):
 
     if id not in id_to_processed_file:
         (namespace, name) = id
-        input_path  = f'data/{namespace}/functions/{name} SRC.mcfunction'
-        output_path = f'data/{namespace}/functions/{name}.mcfunction'
+        input_path  = f'data/{namespace}/functions/{name}{syntax["src_extension"]}'
+        output_path = f'data/{namespace}/functions/{name}{syntax["dest_extension"]}'
         if not os.path.exists(input_path):
             raise ParserError(f"Function {namespace}:{name} does not exist at path: {input_path}")
 
@@ -537,7 +542,7 @@ def process(input_path):
     global path_to_modifytime
 
     print(f'Processing {input_path}...')
-    id = path_to_id(input_path.removesuffix(' SRC.mcfunction'))
+    id = path_to_id(input_path.removesuffix(syntax['src_extension']))
     (compilation_unit, global_scope) = get_processed_file(id)
     
     output_lines = [
@@ -567,8 +572,19 @@ def process(input_path):
 # Command line usage:
 #   python turbo_preprocess.py [input_path]
 if __name__ == '__main__':
-    if len(sys.argv) >= 2:
-        process(sys.argv[1])
+    argparser = argparse.ArgumentParser(description=__doc__)
+    argparser.add_argument('--syntax', required=False, help="The path of a .json file defining alternate source syntax.")
+    argparser.add_argument('filename', nargs='?',      help="The path of a single source file to process.")
+    args = argparser.parse_args()
+
+    if args.syntax:
+        with open(args.syntax, 'r') as syntax_file:
+            alt_syntax = json.load(syntax_file)
+            for key, value in alt_syntax.items():
+                syntax[key] = value
+
+    if args.filename:
+        process(args.filename)
     else:
         path_to_modifytime = {}
         cachefilename = 'turbo_cache.json'
@@ -578,7 +594,7 @@ if __name__ == '__main__':
 
         for root, dirnames, filenames in os.walk('data'):
             for filename in filenames:
-                if filename.endswith(' SRC.mcfunction'):
+                if filename.endswith(syntax['src_extension']):
                     # If the file has changed, process it:
                     input_path = os.path.join(root, filename)
                     if (input_path not in path_to_modifytime) or os.path.getmtime(input_path) > path_to_modifytime[input_path]:
