@@ -33,16 +33,23 @@ syntax = {
     'directive_prefix': '##',
 }
 
+cache_version = 1
+
+def normalize_path(path):
+    return path.replace('\\', '/')
+
 def path_to_id(path):
-    path = path.replace('\\', '/')
-    relpath = os.path.relpath(path, 'data').replace('\\', '/')
+    path = normalize_path(path)
+    relpath = normalize_path(os.path.relpath(path, 'data'))
     namespace = relpath.split('/', 1)[0]
     name = os.path.splitext(relpath)[0].removeprefix(f'{namespace}/functions/')
     return (namespace, name)
 
 class CompilationUnit:
-    def __init__(self, path : str, parent : 'CompilationUnit' = None) -> None:
+    def __init__(self, source_path : str, path : str, parent : 'CompilationUnit' = None) -> None:
+        self.source_path = source_path
         self.path = path
+        self.dependents : set[CompilationUnit] = set()
         self.parent = parent
         (self.namespace, self.id) = path_to_id(path)
         self.anonymous_child_count = 0
@@ -61,7 +68,7 @@ class CompilationUnit:
             head, tail = os.path.split(path)
             path = f'{head}/__turbo/{tail}'
         path += f'_{name}{syntax["dest_extension"]}'
-        return CompilationUnit(path, parent=self)
+        return CompilationUnit(None, path, parent=self)
 
 class ParserError(Exception):
     def __init__(self, message : str, pos : tuple[int] = None) -> None:
@@ -394,18 +401,19 @@ class CommandFunction(Command):
         write_output_file(inner_lines, self.func.compilation_unit.path)
 
 class CommandImport(Command):
-    def __init__(self, scope : Scope, parser : Parser) -> None:
+    def __init__(self, compilation_unit : CompilationUnit, scope : Scope, parser : Parser) -> None:
         global pattern_colon
 
         namespace = parser.expect(re.compile(r'[^:\r\n]+'))
         parser.expect(pattern_colon)
         name = parser.expect(re.compile(r'[^\r\n]+'))
-        (compilation_unit, global_scope) = get_processed_file((namespace, name))
-        for symbol in global_scope.all_symbols():
+        (imported_compilation_unit, imported_scope) = get_processed_file((namespace, name))
+        imported_compilation_unit.dependents.add(compilation_unit)
+        for symbol in imported_scope.all_symbols():
             try:
                 scope.add_symbol(symbol)
             except ParserError as e:
-                pass # Suppress errors from trying to add duplicate variables.
+                pass # Suppress errors from trying to add duplicate variables. TODO: Why?
 
 class CommandEnd(Command):
     pass
@@ -472,7 +480,7 @@ def parse_command(compilation_unit : CompilationUnit, fileparser : FileParser, s
         elif opcode=='function':
             return CommandFunction(compilation_unit, fileparser, scope, parser)
         elif opcode=='import':
-            return CommandImport(scope, parser)
+            return CommandImport(compilation_unit, scope, parser)
         elif opcode=='end':
             return CommandEnd()
         else:
@@ -510,7 +518,7 @@ def write_output_file(lines : list[str], path : str):
         file.write(output)
 
 id_to_processed_file : dict[tuple[str, str], tuple[CompilationUnit, Scope]] = dict()
-def get_processed_file(id):
+def get_processed_file(id : tuple[str]):
     global id_to_processed_file
 
     if id not in id_to_processed_file:
@@ -520,7 +528,7 @@ def get_processed_file(id):
         if not os.path.exists(input_path):
             raise ParserError(f"Function {namespace}:{name} does not exist at path: {input_path}")
 
-        compilation_unit = CompilationUnit(output_path)
+        compilation_unit = CompilationUnit(input_path, output_path)
         input_lines = []
         with open(input_path) as file:
             input_lines = file.readlines()
@@ -536,10 +544,8 @@ def get_processed_file(id):
 
     return id_to_processed_file[id]
 
-path_to_modifytime = {}
-
 def process(input_path):
-    global path_to_modifytime
+    global cache
 
     print(f'Processing {input_path}...')
     id = path_to_id(input_path.removesuffix(syntax['src_extension']))
@@ -567,7 +573,15 @@ def process(input_path):
 
     with open(compilation_unit.path, '+w') as file:
         file.write(output)
-    path_to_modifytime[input_path] = os.path.getmtime(compilation_unit.path)
+    cache['files'][input_path] = {
+        'modified': os.path.getmtime(compilation_unit.path),
+        'dependents': [],
+    }
+
+cache = {
+    'version': cache_version,
+    'files': {},
+}
 
 # Command line usage:
 #   python turbo_preprocess.py [input_path]
@@ -586,21 +600,33 @@ if __name__ == '__main__':
     if args.filename:
         process(args.filename)
     else:
-        path_to_modifytime = {}
+        # Load the cache from disk. Create a new cache if it's missing or using a different version.
         cachefilename = 'turbo_cache.json'
         if os.path.isfile(cachefilename):
             with open(cachefilename, 'r') as file:
-                path_to_modifytime = json.load(file)
-
-        for root, dirnames, filenames in os.walk('data'):
+                found_cache = json.load(file)
+            found_cache_version = found_cache.get('version')
+            if found_cache_version == cache_version:
+                cache = found_cache
+            else:
+                print(f"Expected cache version {cache_version}, but found {found_cache_version}. Clearing the cache.")
+            
+        for dirpath, dirnames, filenames in os.walk('data'):
             for filename in filenames:
                 if filename.endswith(syntax['src_extension']):
                     # If the file has changed, process it:
-                    input_path = os.path.join(root, filename)
-                    if (input_path not in path_to_modifytime) or os.path.getmtime(input_path) > path_to_modifytime[input_path]:
+                    input_path = normalize_path(os.path.join(dirpath, filename))
+                    if (input_path not in cache['files']) or os.path.getmtime(input_path) > cache['files'][input_path]['modified']:
                         process(input_path)
         
+        # After processing files, update the cache.
+        for compilation_unit, global_scope in id_to_processed_file.values():
+            dependents = cache['files'][compilation_unit.source_path]['dependents']
+            for dependent in compilation_unit.dependents:
+                if dependent not in dependents:
+                    dependents.append(dependent.source_path)
+
         with open(cachefilename, 'w+') as file:
-            file.write(json.dumps(path_to_modifytime, indent='  '))
+            file.write(json.dumps(cache, indent='  '))
 
     print('\nDONE')
