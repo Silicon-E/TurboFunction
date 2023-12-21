@@ -12,18 +12,24 @@ Turbo speeds up your .mcfunction coding with constructs including constants, mac
 
 by Silas Barber, 2023.
 
-python turbo_preprocess.py
-    Recursively searches for all .mcfunction files in the data/ directory and processes them.
+usage: turbo_preprocess.py [-h] [--syntax SYNTAX] [--verbose-parse] [filename]
 
-python turbo_preprocess.py <input_path>
-    Processes the .mcfunction file located at <input_path>.
+positional arguments:
+  filename         The path of a single source file to process.
+
+optional arguments:
+  -h, --help       show this help message and exit
+  --syntax SYNTAX  The path of a .json file defining alternate source syntax.
+  --verbose-parse  Print each syntax tree as it is parsed.
 """
 
 
 #   TODO
+# Allow the 'filename' arg to specify a source DIRECTORY, which defaults to ./data/ .
+# Add an arg for a dest directory, which defaults to the source directory.
 # Rebuild all when this python script changes.
-# Rebuild dependee functions when a dependency function changes.
-# Add -clean option.
+# Test if working:  Rebuild dependee functions when a dependency function changes.
+# Add --clean option.
 # Clean output files for a compilation unit before outputting them. This prevents obsolete output files from persisting if they aren't overwritten.
 # Maybe automatically clean output files for sources that no longer exist.
 
@@ -38,7 +44,7 @@ syntax = {
 cache_version = 1
 
 def re_union(*patterns : re.Pattern):
-    return '|'.join(compiled_pattern.pattern for compiled_pattern in patterns)
+    return re.compile('|'.join(compiled_pattern.pattern for compiled_pattern in patterns))
 
 def normalize_path(path):
     return path.replace('\\', '/')
@@ -50,17 +56,28 @@ def path_to_id(path):
     name = os.path.splitext(relpath)[0].removeprefix(f'{namespace}/functions/')
     return (namespace, name)
 
-class CompilationUnit:
-    def __init__(self, source_path : str, path : str, parent : 'CompilationUnit' = None) -> None:
-        self.source_path = source_path
+class TurboFunction:
+    def __init__(self, path : str) -> None:
         self.path = path
-        self.dependents : set[CompilationUnit] = set()
+        (self.namespace, self.name) = path_to_id(path.removesuffix(syntax['src_extension']))
+        self.dependents : set[TurboFunction] = set()
+        self.commands : list[Command] = []
+
+    def id(self):
+        return f'{self.namespace}:{self.id}'
+
+class MinecraftFunction:
+    def __init__(self, path : str, parent : 'MinecraftFunction' = None) -> None:
+        self.path = path
+        (self.namespace, self.name) = path_to_id(path.removesuffix(syntax['dest_extension']))
         self.parent = parent
-        (self.namespace, self.id) = path_to_id(path)
         self.anonymous_child_count = 0
         'Used to give numbered names to anonymous child functions.'
-        pass
+        self.lines : list[str] = []
 
+    def id(self):
+        return f'{self.namespace}:{self.id}'
+    
     def make_child(self, name : str = None):
         if name == None:
             name = str(self.anonymous_child_count)
@@ -73,7 +90,7 @@ class CompilationUnit:
             head, tail = os.path.split(path)
             path = f'{head}/__turbo/{tail}'
         path += f'_{name}{syntax["dest_extension"]}'
-        return CompilationUnit(None, path, parent=self)
+        return MinecraftFunction(path, parent=self)
 
 class ParserError(Exception):
     def __init__(self, message : str, pos : tuple[int] = None) -> None:
@@ -99,32 +116,17 @@ class SymbolArg(Symbol):
         super().__init__(name)
         self.value = None
 
-class SymbolMacro(Symbol): # TODO: Delete.
-    def __init__(self, name: str, argnames: list[str], parent_scope: 'Scope') -> None:
-        super().__init__(name)
-        self.argnames = argnames
-        self.scope = Scope(parent_scope)
-        for argname in argnames:
-            self.scope.add_symbol(SymbolArg(argname))
-    
-    def output(self, lines : list[str], args : list[str]):
-        if len(args) != len(self.argnames):
-            raise ParserError(f"Macro {self.name} expected {len(self.argnames)} arguments, but got {len(args)}.")
-        for i, argname in enumerate(self.argnames):
-            self.scope.symbols[argname].value = args[i]
-        for command in self.scope.code:
-            command.output(self.scope, lines)
-
 class SymbolVariable(Symbol):
     def __init__(self, value : str) -> None:
         self.value = value
 
-    def evaluate(self) -> str:
+    def insert(self) -> str:
         return self.value
 
 class SymbolTemplate(Symbol):
-    def __init__(self, parent_scope : 'Scope', argnames : list[str], commands : list['Command']) -> None:
-        self.parent_scope
+    def __init__(self, parent_scope : 'Scope', parent_target : MinecraftFunction, argnames : list[str], commands : list['Command']) -> None:
+        self.parent_scope = parent_scope
+        self.parent_target = parent_target
         self.argnames = argnames
         self.commands = commands
 
@@ -142,24 +144,17 @@ class SymbolTemplate(Symbol):
                 arg = SymbolVariable(arg)
             inner_scope.add_symbol(argname, arg)
 
-        inner_lines = []
+        inner_target = self.parent_target.make_child()
         for command in self.commands:
-            command.output(inner_scope, inner_lines)
-        return '\n'.join(inner_lines)
+            command.output(inner_scope, inner_target)
+        return '\n'.join(inner_target.lines)
 
 class SymbolFunction(Symbol):
-    def __init__(self, name: str, parent_scope: 'Scope', parent_unit : CompilationUnit) -> None:
-        super().__init__(name)
-        self.scope = Scope(parent_scope)
-        self.compilation_unit = parent_unit.make_child(name.lower())
-        # Functions are defined in the scope of their own bodies, allowing recursion.
-        self.scope.add_symbol(self)
-
-    def mcfunction_id(self):
-        return f'{self.compilation_unit.namespace}:{self.compilation_unit.id}'
+    def __init__(self, id: str) -> None:
+        self.id = id
     
     def insert(self):
-        return self.mcfunction_id()
+        return self.id
 
 class Scope:
     def __init__(self, parent : 'Scope' = None) -> None:
@@ -179,6 +174,12 @@ class Scope:
             return self.parent.get_symbol(name)
         else:
             return None
+        
+    def require_symbol(self, name):
+        symbol = self.get_symbol(name)
+        if symbol is None:
+            raise ParserError(f"No such symbol: {name}")
+        return symbol
     
     def all_symbols(self) -> dict[str, Symbol]:
         result = self.symbols.copy()
@@ -195,6 +196,7 @@ class Scope:
 pattern_name = re.compile(r'[A-Za-z][A-Za-z0-9_]*')
 pattern_string = re.compile(r'"(?:[^"\r\n]|\\")*"')
 pattern_any_whitespace = re.compile(r'[^\S\r\n]*')
+pattern_newline = re.compile(r"\r?\n")
 pattern_lparen  = re.compile(r'\(')
 pattern_rparen  = re.compile(r'\)')
 pattern_rcurly  = re.compile(r'\}')
@@ -205,7 +207,7 @@ pattern_directive_prefix = re.compile(f"{re.escape(syntax['directive_prefix'])}"
 pattern_embed_escape = re.compile(r'\\')
 pattern_embed_open         = re.compile(f"{re.escape(syntax['embed_open'])}")
 pattern_embed_close        = re.compile(f"{re.escape(syntax['embed_close'])}")
-pattern_not_newline        = re.compile(f".")
+pattern_not_newline = re.compile(f".")
 
 class Parser:
     def __init__(self, text : str) -> None:
@@ -351,7 +353,7 @@ class Embed():
 
         return result
     
-    def evaluate(self, scope : Scope) -> str:
+    def evaluate(self, scope : Scope):
         raise NotImplementedError()
 
 class Insertion(Embed):
@@ -359,9 +361,12 @@ class Insertion(Embed):
         super().__init__()
         self.name = name
 
-    def evaluate(self, scope: Scope) -> str:
+    def __repr__(self) -> str:
+        return f"(Insertion: {repr(self.name)})"
+
+    def evaluate(self, scope: Scope):
         name = self.name.evaluate(scope)
-        symbol = scope.get_symbol(name)
+        symbol = scope.require_symbol(name)
         return symbol.insert()
 
 class Invocation(Embed):
@@ -369,16 +374,19 @@ class Invocation(Embed):
         super().__init__()
         self.name = name
         self.args = args
+
+    def __repr__(self) -> str:
+        return f"(Invocation: {repr(self.name)}, {repr(self.args)})"
     
-    def evaluate(self, scope: Scope) -> str:
+    def evaluate(self, scope: Scope):
         name = self.name.evaluate(scope)
-        symbol = scope.get_symbol(name)
+        symbol = scope.require_symbol(name)
         args = [arg.evaluate(scope) for arg in self.args]
         return symbol.invoke(args)
 
 class Code(list):
     @staticmethod
-    def parse(parser : Parser, pattern_terminator : re.Pattern = None):
+    def parse(parser : Parser, pattern_terminator : re.Pattern):
         result = Code()
         current_str = ''
         while parser.any():
@@ -391,7 +399,7 @@ class Code(list):
                     current_str += text
                 elif text := parser.allow(pattern_embed_close, strict=True):
                     current_str += text
-            elif parser.peek(pattern_embed_open, strict=True):
+            elif parser.peek(pattern_embed_open):
                 if current_str:
                     result.append(current_str)
                     current_str = ''
@@ -406,41 +414,61 @@ class Code(list):
         
         return result
 
-    def evaluate(self, scope : Scope) -> str:
+    def evaluate(self, scope : Scope):
         result = ''
         for item in self:
+            evaluated = None
             if isinstance(item, str):
-                result += item
+                evaluated = item
             elif isinstance(item, Embed):
-                result += item.evaluate(scope)
+                evaluated = item.evaluate(scope)
             else:
                 raise RuntimeError(f"Code must contain only strs or Embeds, but contains: {repr(item)}")
 
+            if isinstance(evaluated, str):
+                if not isinstance(result, str):
+                    raise ParserError(f"Can't mix a symbol embed with other code, but found: {repr(evaluated)} after: {repr(result)}")
+                result += evaluated
+            else:
+                assert isinstance(evaluated, Symbol)
+                if result != '':
+                    raise ParserError(f"Can't mix a symbol embed with other code, but found: {repr(evaluated)} after: {repr(result)}")
+                result = evaluated
+
+        return result
+
 class Command:
-    def output(self, scope : Scope, lines : list[str]):
+    def output(self, scope : Scope, target : MinecraftFunction):
         raise NotImplementedError()
 
 class CommandPlaintext(Command):
     def __init__(self, code : Code) -> None:
         self.code = code
-    
-    def output(self, scope : Scope, lines : list[str]):
-        lines.append(self.code.evaluate(scope))
+
+    def __repr__(self) -> str:
+        return f"(CommandPlaintext: {repr(self.code)})"
+
+    @staticmethod
+    def parse(parser : Parser) -> 'CommandPlaintext':
+        code = Code.parse(parser, pattern_newline)
+        code.append(parser.allow(pattern_newline, strict=True) or '')
+        return CommandPlaintext(code)
+
+    def output(self, scope : Scope, target : MinecraftFunction):
+        evaluated = self.code.evaluate(scope)
+        if isinstance(evaluated, Symbol):
+            raise ParserError(f"A symbol embed is not a valid command, but found: {repr(evaluated)}")
+        target.lines.append(evaluated)
 
 class CommandComment(Command):
     def __init__(self, text : str) -> None:
         self.text = text
     
-    def output(self, scope : Scope, lines : list[str]):
-        lines.append(self.text)
+    def output(self, scope : Scope, target : MinecraftFunction):
+        target.lines.append(self.text)
 
 class CommandDefine(Command):
     def __init__(self, lineparser : FileParser, parser : Parser) -> None:
-        global pattern_name
-        global pattern_lparen
-        global pattern_rparen
-        global pattern_comma
-        global pattern_any_whitespace
 
         self.name = parser.expect(pattern_name)
 
@@ -453,11 +481,12 @@ class CommandDefine(Command):
         self.commands = None
         parser.allow(pattern_any_whitespace, strict=True)
         if parser.any(): # Symbol is defined in 1 line:
-            self.code = Code.parse(parser)
+            self.code = Code.parse(parser, pattern_newline)
+            parser.allow(pattern_newline, strict=True)
         else: # No inline definition:
             self.commands = parse_block(lineparser)
     
-    def output(self, scope : Scope, lines : list[str]):
+    def output(self, scope : Scope, target : MinecraftFunction):
         symbol : Symbol
         if self.arg_names is None:
             # Define a variable. Variables are evaluated now, when they are defined.
@@ -480,29 +509,30 @@ class CommandDefine(Command):
             else:
                 assert self.commands is not None
                 commands = self.commands
-            symbol = SymbolTemplate(scope, self.arg_names, commands)
+            symbol = SymbolTemplate(scope, target, self.arg_names, commands)
         
         scope.add_symbol(self.name, symbol)
 
 class CommandBlock(Command):
     do_not_inline = True
 
-    def __init__(self, compilation_unit : CompilationUnit, lineparser : FileParser, scope : Scope, parser : Parser) -> None:
+    def __init__(self, lineparser : FileParser, parser : Parser) -> None:
+        parser.allow(pattern_any_whitespace, strict=True)
+        if parser.any():
+            raise ParserError(f"Expected nothing after {syntax['directive_prefix']}block but found: {parser.peek()}")
+        
         self.condition_command = lineparser.next().strip(' \r\n\t')
         if not self.condition_command.removeprefix('$').startswith('execute '):
             raise ParserError(f"The line following a {syntax['directive_prefix']}block must be a stub 'execute' command.")
-        self.scope = Scope(scope)
-        self.scope.code = parse_block(lineparser)
-        
-        
+        self.commands = parse_block(lineparser)
     
-    def output(self, scope: Scope, lines: list[str]):
+    def output(self, scope: Scope, target : MinecraftFunction):
         if CommandBlock.do_not_inline:
-            self.compilation_unit = compilation_unit.make_child()
+            pass
 
         else:
             # Prepend this block's condition to each command in the block. In other words, "inline" the block.
-            for command in self.scope.code:
+            for command in self.commands:
                 if isinstance(command, CommandPlaintext):
                     line = command.code.evaluate(scope)
                     line = line.lstrip(' \r\n\t')
@@ -521,96 +551,60 @@ class CommandBlock(Command):
                         line = condition + line
                     command.code = Code([line])
 
-        inner_lines = []
-        for command in self.scope.code:
-            command.output(self.scope, inner_lines)
+        inner_scope = Scope(scope)
 
-        compilation_unit_instance = self.compilation_unit.make_child()
         if CommandBlock.do_not_inline:
-            write_output_file(inner_lines, compilation_unit_instance.path)
+            inner_target = target.make_child()
+            for command in self.commands:
+                command.output(inner_scope, inner_target)
+            write_output_file(inner_target.lines, inner_target.path)
+
             CommandPlaintext(
-                Code([ f'{self.condition_command} run function {compilation_unit_instance.namespace}:{compilation_unit_instance.id}\n' ])
-            ).output(scope, lines)
-        
+                Code([ f'{self.condition_command} run function {inner_target.id()}\n' ])
+            ).output(scope, target)
         else:
-            for line in inner_lines:
-                lines.append(line)
+            for command in self.commands:
+                command.output(inner_scope, target)
         
 class CommandFunction(Command):
-    def __init__(self, compilation_unit : CompilationUnit, lineparser : FileParser, scope : Scope, parser : Parser) -> None:
-        global pattern_name
+    def __init__(self, lineparser : FileParser, parser : Parser) -> None:
+        self.name = parser.expect(pattern_name)
+        parser.allow(pattern_any_whitespace, strict=True)
+        if parser.any():
+            raise ParserError(f"Expected nothing after the function name, but found: {repr(parser.peek())}")
+        self.commands = parse_block(lineparser)
 
-        name = parser.expect(pattern_name)
-
-        self.func = SymbolFunction(name, scope, compilation_unit)
-        parse_block(self.func.compilation_unit, lineparser, self.func.scope)
-        scope.add_symbol(name, self.func)
-
-    def output(self, scope: Scope, lines: list[str]):
-        inner_lines = []
+    def output(self, scope: Scope, target : MinecraftFunction):
+        inner_mcfunction = target.make_child(self.name.lower())
+        symbol = SymbolFunction(inner_mcfunction.id())
+        inner_scope = Scope(scope)
+        # Functions are defined in the scope of their own bodies, allowing recursion.
+        inner_scope.add_symbol(symbol)
         for command in self.func.scope.code:
-            command.output(self.func.scope, inner_lines)
-        write_output_file(inner_lines, self.func.compilation_unit.path)
+            command.output(inner_scope, inner_mcfunction.lines)
+
+        scope.add_symbol(self.name, symbol)
+        write_output_file(inner_mcfunction.lines, inner_mcfunction.path)
 
 class CommandImport(Command):
-    def __init__(self, compilation_unit : CompilationUnit, scope : Scope, parser : Parser) -> None:
+    def __init__(self, parser : Parser) -> None:
         global pattern_colon
 
-        namespace = parser.expect(re.compile(r'[^:\r\n]+'))
+        self.namespace = parser.expect(re.compile(r'[^:\r\n]+'))
         parser.expect(pattern_colon)
-        name = parser.expect(re.compile(r'[^\r\n]+'))
-        (imported_compilation_unit, imported_scope) = get_processed_file((namespace, name))
-        imported_compilation_unit.dependents.add(compilation_unit)
+        self.name = parser.expect(re.compile(r'[^\r\n]+'))
+    
+    def output(self, scope: Scope, target : MinecraftFunction):
+        (imported_compilation_unit, imported_scope) = get_processed_file((self.namespace, self.name))
+        imported_compilation_unit.dependents.add(source)
         for name, symbol in imported_scope.all_symbols().items():
             try:
-                scope.add_symbol(symbol)
+                scope.add_symbol(name, symbol)
             except ParserError as e:
                 pass # Suppress errors from trying to add duplicate variables. TODO: Why?
 
 class CommandEnd(Command):
     pass
-
-def replace_symbols(scope : Scope, line : str) -> str:
-    global pattern_lparen
-    global pattern_comma
-
-    symbols = scope.all_symbols().values()
-    symbols.sort(key = lambda symbol: len(symbol.name), reverse=True)
-    while True:
-        for symbol in symbols:
-            #match = re.compile(fr'\b{symbol.name}\b').search(line)
-            match = re.compile(fr'{symbol.name}').search(line)
-            if match:
-                parser = Parser(line)
-                parser.index = match.end()
-                value = ''
-                if isinstance(symbol, SymbolMacro):
-                    arg_values = []
-                    if parser.allow(pattern_lparen):
-                        arg_values = parse_sequence(parser, parse_expr, pattern_comma)
-                        parser.expect(pattern_rparen)
-                    arg_values = [replace_symbols(scope, v) for v in arg_values]
-                    lines = []
-                    
-                    try:
-                        symbol.output(lines, arg_values)
-                    except ParserError as err:
-                        if err.pos == None:
-                            err.pos = (0,0)
-                        err.pos = (err.pos[1], parser.index+1)
-                        raise err
-                    
-                    value = ''.join(lines).rstrip('\r\n')
-                elif isinstance(symbol, SymbolArg):
-                    value = symbol.value
-                elif isinstance(symbol, SymbolFunction):
-                    value = symbol.mcfunction_id()
-
-                line = line[:match.start()] + value + line[parser.index:]
-                break
-        else:
-            break
-    return line
 
 def parse_command(fileparser : FileParser) -> Command:
     line = fileparser.next()
@@ -623,11 +617,11 @@ def parse_command(fileparser : FileParser) -> Command:
         if opcode=='define':
             return CommandDefine(fileparser, parser)
         elif opcode=='block':
-            return CommandBlock(compilation_unit, fileparser, scope, parser)
+            return CommandBlock(fileparser, parser)
         elif opcode=='function':
-            return CommandFunction(compilation_unit, fileparser, scope, parser)
+            return CommandFunction(fileparser, parser)
         elif opcode=='import':
-            return CommandImport(compilation_unit, scope, parser)
+            return CommandImport(parser)
         elif opcode=='end':
             return CommandEnd()
         else:
@@ -635,7 +629,7 @@ def parse_command(fileparser : FileParser) -> Command:
     elif normalized_line.startswith('#'):
         return CommandComment(normalized_line)
     else:
-        return CommandPlaintext(Code.parse(parser))
+        return CommandPlaintext.parse(parser)
 
 def parse_block(lineparser : FileParser) -> list[Command]:
     result = []
@@ -669,7 +663,7 @@ def write_output_file(lines : list[str], path : str):
     with open(path, '+w') as file:
         file.write(output)
 
-id_to_processed_file : dict[tuple[str, str], tuple[CompilationUnit, Scope]] = dict()
+id_to_processed_file : dict[tuple[str, str], tuple[TurboFunction, Scope]] = dict()
 def get_processed_file(id : tuple[str]):
     global id_to_processed_file
 
@@ -680,21 +674,26 @@ def get_processed_file(id : tuple[str]):
         if not os.path.exists(input_path):
             raise ParserError(f"Function {namespace}:{name} does not exist at path: {input_path}")
 
-        compilation_unit = CompilationUnit(input_path, output_path)
+        source = TurboFunction(input_path)
         input_lines = []
         with open(input_path) as file:
             input_lines = file.readlines()
         lineparser = FileParser(input_lines)
 
-        global_scope = Scope()
         try:
-            commands = []
             while lineparser.any():
-                commands.append(parse_command(lineparser))
+                source.commands.append(parse_command(lineparser))
         except ParserError as err:
             log_error(lineparser, None, err)
         
-        id_to_processed_file[id] = (compilation_unit, global_scope)
+        if verbose_parse:
+            for command in source.commands:
+                print(repr(command))
+
+        global_scope = Scope()
+
+        
+        id_to_processed_file[id] = (source, global_scope)
 
     return id_to_processed_file[id]
 
@@ -703,18 +702,19 @@ def process(input_path):
 
     print(f'Processing {input_path}...')
     id = path_to_id(input_path.removesuffix(syntax['src_extension']))
-    (compilation_unit, global_scope) = get_processed_file(id)
+    (source, global_scope) = get_processed_file(id)
     
-    output_lines = [
+    target = MinecraftFunction(input_path.removesuffix(syntax['src_extension']) + syntax['dest_extension'])
+    target.lines = [
         f'########################################################\n',
         f'###          TURBO PREPROCESSOR Output File          ###\n',
         f'###     Source:  {input_path}\n',
         f'########################################################\n',
         f'\n',
     ]
-    for index, command in enumerate(global_scope.code):
+    for index, command in enumerate(source.commands):
         try:
-            command.output(global_scope, output_lines)
+            command.output(global_scope, target)
         except ParserError as err:
             if err.pos == None:
                 err.pos = (-1,-1)
@@ -722,13 +722,13 @@ def process(input_path):
             log_error(None, None, err)
 
     output = ''
-    for line in output_lines:
+    for line in target.lines:
         output += line
 
-    with open(compilation_unit.path, '+w') as file:
+    with open(target.path, '+w') as file:
         file.write(output)
     cache['files'][input_path] = {
-        'modified': os.path.getmtime(compilation_unit.path),
+        'modified': os.path.getmtime(target.path),
         'dependents': [],
     }
 
@@ -736,14 +736,18 @@ cache = {
     'version': cache_version,
     'files': {},
 }
+verbose_parse = False
 
 # Command line usage:
 #   python turbo_preprocess.py [input_path]
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser(description=__doc__)
     argparser.add_argument('--syntax', required=False, help="The path of a .json file defining alternate source syntax.")
-    argparser.add_argument('filename', nargs='?',      help="The path of a single source file to process.")
+    argparser.add_argument('--verbose-parse', required=False, action='store_true', help="Print each syntax tree as it is parsed.")
+    argparser.add_argument('filename', nargs='?', help="The path of a single source file to process.")
     args = argparser.parse_args()
+
+    verbose_parse = args.verbose_parse
 
     if args.syntax:
         with open(args.syntax, 'r') as syntax_file:
@@ -774,11 +778,11 @@ if __name__ == '__main__':
                         process(input_path)
         
         # After processing files, update the cache.
-        for compilation_unit, global_scope in id_to_processed_file.values():
-            dependents = cache['files'][compilation_unit.source_path]['dependents']
-            for dependent in compilation_unit.dependents:
+        for source, global_scope in id_to_processed_file.values():
+            dependents = cache['files'][source.path]['dependents']
+            for dependent in source.dependents:
                 if dependent not in dependents:
-                    dependents.append(dependent.source_path)
+                    dependents.append(dependent.path)
 
         with open(cachefilename, 'w+') as file:
             file.write(json.dumps(cache, indent='  '))
