@@ -5,7 +5,7 @@ Turbo speeds up your .mcfunction coding with constructs including constants, mac
 
 # Syntax
 
-Turbo acts on source files. Each source file represents a function. Turbo source files are text files in the `data/` folder of a data pack that have filenames endind in "` SRC.mcfunction`" (note the separating space). These files are discarded by Minecraft when it loads the data pack. Each Turbo source file compiles to a .mcfunction file at the same location with the same name, sans the "` SRC`" suffix.
+Turbo acts on source files. Each source file represents a function. Turbo source files are text files in the `data/` folder of a data pack that have filenames ending in "` SRC.mcfunction`" (note the separating space). These files are discarded by Minecraft when it loads the data pack. Each Turbo source file compiles to a .mcfunction file at the same location with the same name, sans the "` SRC`" suffix.
 
 Turbo source files consist of lines separated by line endings. Each line is one of:
 - Whitespace
@@ -14,8 +14,13 @@ Turbo source files consist of lines separated by line endings. Each line is one 
 - A preprocessor directive
 
 Whitespace and comments are transcluded into the output.
-Some directives define **symbols**. Symbols are names containing *uppercase letters, underscores, and numbers*.
-Commands are transcluded into the output, with any occurrences of symbol names replaced with those symbols' **values**. Where multiple symbols occur, the shortest symbol is replaced first.
+Some directives define **symbols**. Symbols are names containing *letters, underscores, and numbers*. Symbols can generate code by way of **embeds**.
+Commands contain **code**. Code is transcluded into the output, with any embeds replaced with the text those embeds evaluate to. Top-level embeds in a command must evaluate to text.
+
+### Embeds
+
+All embeds begin with a `%(` and end with a closing `)`. Either bound can be escaped with a leading `\`. Embeds evaluate to some value. Each embed is either an **insertion** or an **invocation**. Insertions have the form:
+`%( symbol )`. Invocations have the form: `%( symbol : arg , arg , ... )`. `symbol` is code that must evaluate to a defined symbol. `arg` is code that may evaluate to any value. Code within embeds may contain other embeds.
 
 ### Code Blocks
 
@@ -28,36 +33,51 @@ Marks the end of a code block.
 
 ### ##define
 
-Defines a type of symbol called a **macro**. The value of a macro is the text supplied to the `##define` directive that defined it.
+Defines one of two types of symbol: a **variable** or a **template**.
 
 `##define` directives have two forms:
 > ```
-> ##define <name>[( <arg1 name> , <arg2 name> , ... )] <value>
+> ##define <name>[( <arg1 name> , <arg2 name> , ... )] <body>
 > 
 > ##define <name>[( <arg name> , ... )]
->     <value>
+>     <body>
 >     ...
 > ##end
 > ```
 > `name` - A valid symbol name.
 > 
-> `value` - Any text. The macro's argument symbols are in scope throughout the value.
+> `body` - Code. If defining a variable, the body is evaluated immediately. If defining a template, the template's argument symbols are in scope throughout the body.
 
-Macros may have arguments. Macros with one or more arguments are defined and used like this:
-```
-##define FOO(ARG1, ARG2) Args are ARG1 and ARG2
-FOO(bar, baz)
-```
-Where a macro is invoked with arguments, whitespace on either side of the argument is discarded. Put your argument in double quotes (like `" baz "`) if you want some surrounding whitespace to be included.
+If no argument list is given, defines a variable. When inserted, a variable evaluates to the value that its body evaluated to. Variables cannot be invoked.
 
-#### Example
+If an argument list is given, defines a template. When inserted, a template evaluates to a reference to itself. When invoked, a template evaluates to the value that its body evaluates to, considering the values of the argument symbols supplied to the invocation.
+
+#### Examples
+Basics:
 ```
-##define OFFSET ~0 ~15.1 ~2
-##define HANDLE_ENTITY(ENTITY_ID, PARTICLE)
-    execute at @e[type=ENTITY_ID] run particle PARTICLE OFFSET
+##define offset ~0 ~15.1 ~2
+##define handle_entity(entity_id, particle)
+    execute at @e[type=%( entity_id )] run particle %( particle ) OFFSET
 ##end
-HANDLE_ENTITY(creeper, block lime_wool)
-HANDLE_ENTITY(player,  instant_effect)
+%( handle_entity : creeper, block lime_wool )
+%( handle_entity : player,  instant_effect )
+```
+Passing template references:
+```
+##define invoke_twice(template, arg)
+    %( template : %( arg ) )
+    %( template : %( arg ) )
+##end
+##define foo(bar) say %( bar )
+%( invoke_twice : $( foo ), Hello World! )
+```
+Indirect variable insertion:
+```
+##define coal__value 60
+##define iron__value 100
+##define sell(mineral)
+    scoreboard players add @s money $( $( mineral )__value )
+##end
 ```
 
 ### ##block
@@ -91,7 +111,7 @@ execute if block ~ ~ ~ gold_ore run function mydatapack:path_to_source/__turbo/s
 
 ### ##function
 
-Defines a type of symbol called a **local function**. The value of a local function is the namespaced ID of a function generated by Turbo containing the text supplied to the `##function` directive.
+Defines a type of symbol called a **local function**. When inserted, a local function evaluates to the namespaced ID of a function generated by Turbo containing the code supplied to the `##function` directive. Local functions cannot be invoked.
 
 > ```
 > ##function <name>
@@ -106,17 +126,17 @@ Defines a type of symbol called a **local function**. The value of a local funct
 #### Example
 
 ```
-##function LOOP
+##function loop
     scoreboard players remove #reach num 1
-    execute if score #reach num matches 1.. run function LOOP
+    execute if score #reach num matches 1.. run function %( loop )
 ##end
 scoreboard players set #reach num 5
-function LOOP
+function %( loop )
 ```
 
 ### ##include
 
-Defines all the symbols that are defined in another source file.
+Defines all the symbols that are defined in the top-level scope of another source file.
 
 > ```
 > ##include <source>
@@ -127,9 +147,5 @@ Defines all the symbols that are defined in another source file.
 
 ```
 ##include turbopreprocess:num
-OP(#foo num = @s num)
+%( op : #foo num = @s num )
 ```
-
-### ##insert
-
-Obsolete. Do not use.
