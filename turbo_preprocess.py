@@ -4,6 +4,7 @@ import sys
 import json
 import argparse
 from typing import Callable
+from dataclasses import dataclass, field
 
 
 """
@@ -41,13 +42,13 @@ syntax = {
     'embed_close': ')',
 }
 
-cache_version = 1
+cache_version = 2
 
 def re_union(*patterns : re.Pattern):
     return re.compile('|'.join(compiled_pattern.pattern for compiled_pattern in patterns))
 
 def normalize_path(path):
-    return path.replace('\\', '/')
+    return os.path.normpath(path).replace('\\', '/')
 
 def path_to_id(path):
     path = normalize_path(path)
@@ -67,16 +68,17 @@ class TurboFunction:
         return f'{self.namespace}:{self.id}'
 
 class MinecraftFunction:
-    def __init__(self, path : str, parent : 'MinecraftFunction' = None) -> None:
+    def __init__(self, path : str, source : TurboFunction, parent : 'MinecraftFunction' = None) -> None:
         self.path = path
         (self.namespace, self.name) = path_to_id(path.removesuffix(syntax['dest_extension']))
+        self.source = source
         self.parent = parent
         self.anonymous_child_count = 0
         'Used to give numbered names to anonymous child functions.'
         self.lines : list[str] = []
 
     def id(self):
-        return f'{self.namespace}:{self.id}'
+        return f'{self.namespace}:{self.name}'
     
     def make_child(self, name : str = None):
         if name == None:
@@ -90,7 +92,25 @@ class MinecraftFunction:
             head, tail = os.path.split(path)
             path = f'{head}/__turbo/{tail}'
         path += f'_{name}{syntax["dest_extension"]}'
-        return MinecraftFunction(path, parent=self)
+        return MinecraftFunction(path, source=self.source, parent=self)
+    
+    def write(self):
+        output = ''
+        for line in self.lines:
+            output += line
+    
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        with open(self.path, '+w') as file:
+            file.write(output)
+
+def output_file_header(target : MinecraftFunction):
+    return [
+        f'########################################################\n',
+        f'###          TURBO PREPROCESSOR Output File          ###\n',
+        f'###     Source:  {target.source.path}\n',
+        f'########################################################\n',
+        f'\n',
+    ]
 
 class ParserError(Exception):
     def __init__(self, message : str, pos : tuple[int] = None) -> None:
@@ -339,12 +359,12 @@ class Embed():
     @staticmethod
     def parse(parser : Parser) -> 'Embed':
         parser.expect(pattern_embed_open)
-        name = Code.parse(parser, re_union(pattern_embed_close, pattern_colon))
+        name = ArgCode.parse(parser, re_union(pattern_embed_close, pattern_colon))
 
         result : Embed
         if parser.allow(pattern_colon):
             pattern_terminator = re_union(pattern_embed_close, pattern_comma)
-            args = parse_sequence(parser, lambda p: Code.parse(p, pattern_terminator), pattern_comma)
+            args = parse_sequence(parser, lambda p: ArgCode.parse(p, pattern_terminator), pattern_comma)
             result = Invocation(name, args)
         else:
             result = Insertion(name)
@@ -435,6 +455,19 @@ class Code(list):
                     raise ParserError(f"Can't mix a symbol embed with other code, but found: {repr(evaluated)} after: {repr(result)}")
                 result = evaluated
 
+        return result
+
+class ArgCode(Code):
+    @staticmethod
+    def parse(parser : Parser, pattern_terminator : re.Pattern):
+        result = Code.parse(parser, pattern_terminator)
+        # Strip surrounding whitespace.
+        if len(result) > 0:
+            if isinstance(result[0], str):
+                result[0] = result[0].lstrip()
+            if isinstance(result[-1], str):
+                result[-1] = result[-1].rstrip()
+        
         return result
 
 class Command:
@@ -555,9 +588,10 @@ class CommandBlock(Command):
 
         if CommandBlock.do_not_inline:
             inner_target = target.make_child()
+            inner_target.lines = output_file_header(inner_target)
             for command in self.commands:
                 command.output(inner_scope, inner_target)
-            write_output_file(inner_target.lines, inner_target.path)
+            inner_target.write()
 
             CommandPlaintext(
                 Code([ f'{self.condition_command} run function {inner_target.id()}\n' ])
@@ -570,21 +604,21 @@ class CommandFunction(Command):
     def __init__(self, lineparser : FileParser, parser : Parser) -> None:
         self.name = parser.expect(pattern_name)
         parser.allow(pattern_any_whitespace, strict=True)
-        if parser.any():
+        if parser.any() and not parser.peek(pattern_newline):
             raise ParserError(f"Expected nothing after the function name, but found: {repr(parser.peek())}")
         self.commands = parse_block(lineparser)
 
     def output(self, scope: Scope, target : MinecraftFunction):
-        inner_mcfunction = target.make_child(self.name.lower())
-        symbol = SymbolFunction(inner_mcfunction.id())
+        inner_target = target.make_child(self.name.lower())
+        inner_target.lines = output_file_header(inner_target)
+        symbol = SymbolFunction(inner_target.id())
         inner_scope = Scope(scope)
         # Functions are defined in the scope of their own bodies, allowing recursion.
-        inner_scope.add_symbol(symbol)
-        for command in self.func.scope.code:
-            command.output(inner_scope, inner_mcfunction.lines)
-
         scope.add_symbol(self.name, symbol)
-        write_output_file(inner_mcfunction.lines, inner_mcfunction.path)
+        for command in self.commands:
+            command.output(inner_scope, inner_target)
+
+        inner_target.write()
 
 class CommandImport(Command):
     def __init__(self, parser : Parser) -> None:
@@ -644,24 +678,10 @@ def parse_block(lineparser : FileParser) -> list[Command]:
     return result
 
 
+##################################################
+#                    Building                    #
+##################################################
 
-
-def write_output_file(lines : list[str], path : str):
-    output_lines = [
-        f'########################################################\n',
-        f'###          TURBO PREPROCESSOR Output File          ###\n',
-    #    f'###     Source:  {self.func.compilation_unit. ... parent?}\n',
-        f'########################################################\n',
-        f'\n',
-    ] + lines
-
-    output = ''
-    for line in output_lines:
-        output += line
-
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, '+w') as file:
-        file.write(output)
 
 id_to_processed_file : dict[tuple[str, str], tuple[TurboFunction, Scope]] = dict()
 def get_processed_file(id : tuple[str]):
@@ -697,21 +717,17 @@ def get_processed_file(id : tuple[str]):
 
     return id_to_processed_file[id]
 
-def process(input_path):
+def process(input_path, output_path):
     global cache
 
     print(f'Processing {input_path}...')
+    # Imports can cause sources to be processed before they're iterated over in the source directory. get_processed_file() handles this.
     id = path_to_id(input_path.removesuffix(syntax['src_extension']))
     (source, global_scope) = get_processed_file(id)
     
-    target = MinecraftFunction(input_path.removesuffix(syntax['src_extension']) + syntax['dest_extension'])
-    target.lines = [
-        f'########################################################\n',
-        f'###          TURBO PREPROCESSOR Output File          ###\n',
-        f'###     Source:  {input_path}\n',
-        f'########################################################\n',
-        f'\n',
-    ]
+    target = MinecraftFunction(output_path, source)
+    target.lines = output_file_header(target)
+
     for index, command in enumerate(source.commands):
         try:
             command.output(global_scope, target)
@@ -721,33 +737,57 @@ def process(input_path):
             err.pos = (index+1, err.pos[1])
             log_error(None, None, err)
 
-    output = ''
-    for line in target.lines:
-        output += line
+    target.write()
+    
+    # Update the cache.
+    cache_source = cache['sources'].get(input_path, CacheSource())
+    cache['sources'][input_path] = cache_source
+    cache_artifact = cache_source['artifacts'].get(target.path, CacheArtifact())
+    cache_source['artifacts'][target.path] = cache_artifact
+    cache_artifact['modified'] = os.path.getmtime(target.path)
 
-    with open(target.path, '+w') as file:
-        file.write(output)
-    cache['files'][input_path] = {
-        'modified': os.path.getmtime(target.path),
-        'dependents': [],
+def CacheArtifact():
+    return {
+        'modified': -1.0,
     }
 
-cache = {
-    'version': cache_version,
-    'files': {},
-}
-verbose_parse = False
+def CacheSource():
+    return {
+        'dependents': list(),
+        'artifacts': dict(),
+    }
 
-# Command line usage:
-#   python turbo_preprocess.py [input_path]
+def Cache():
+    return {
+        'version': cache_version,
+        'sources': dict(),
+    }
+
+cache = Cache()
+verbose_parse : bool = False
+
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser(description=__doc__)
     argparser.add_argument('--syntax', required=False, help="The path of a .json file defining alternate source syntax.")
-    argparser.add_argument('--verbose-parse', required=False, action='store_true', help="Print each syntax tree as it is parsed.")
-    argparser.add_argument('filename', nargs='?', help="The path of a single source file to process.")
+    argparser.add_argument('--verbose-parse', required=False, action='store_true', help="Print each syntax tree as it is parsed. Defaults to True if 'source' is a file.")
+    argparser.add_argument('--rebuild', required=False, action='store_true', help="Process each source file, even if it is up-to-date.")
+    argparser.add_argument('source',      nargs='?', default='data/', help="The path to a source file or directory containing source files.")
+    argparser.add_argument('destination', nargs='?',                  help="The path under which to output .mcfunction files, or the path at which to create a single .mcfunction file. Defaults to outputting alongside source files.")
     args = argparser.parse_args()
 
     verbose_parse = args.verbose_parse
+    source_dest_are_dirs = os.path.isdir(args.source)
+    destination : str
+    if args.destination is not None:
+        destination = args.destination
+    else:
+        if source_dest_are_dirs:
+            destination = args.source
+        else:
+            destination = args.source.removesuffix(syntax['src_extension']) + syntax['dest_extension']
+
+    if source_dest_are_dirs and not os.path.isdir(destination):
+        raise ValueError(f"When 'source' is a directory like {args.source}, 'destination' must also be an existing directory, but instead it was: {destination}")
 
     if args.syntax:
         with open(args.syntax, 'r') as syntax_file:
@@ -755,36 +795,52 @@ if __name__ == '__main__':
             for key, value in alt_syntax.items():
                 syntax[key] = value
 
-    if args.filename:
-        process(args.filename)
-    else:
-        # Load the cache from disk. Create a new cache if it's missing or using a different version.
-        cachefilename = 'turbo_cache.json'
-        if os.path.isfile(cachefilename):
-            with open(cachefilename, 'r') as file:
-                found_cache = json.load(file)
-            found_cache_version = found_cache.get('version')
-            if found_cache_version == cache_version:
-                cache = found_cache
-            else:
-                print(f"Expected cache version {cache_version}, but found {found_cache_version}. Clearing the cache.")
-            
-        for dirpath, dirnames, filenames in os.walk('data'):
+    # Load the cache from disk. Create a new cache if it's missing or using a different version.
+    cachefilename = 'turbo_cache.json'
+    if os.path.isfile(cachefilename):
+        with open(cachefilename, 'r') as file:
+            found_cache = json.load(file)
+        found_cache_version = found_cache.get('version')
+        if found_cache_version == cache_version:
+            cache = found_cache
+        else:
+            print(f"Expected cache version {cache_version}, but found {found_cache_version}. Clearing the cache.")
+    
+    # Iterate over the source files, and process them if needed.
+    def source_paths_in(dir):
+        for dirpath, dirnames, filenames in os.walk(dir):
             for filename in filenames:
                 if filename.endswith(syntax['src_extension']):
-                    # If the file has changed, process it:
-                    input_path = normalize_path(os.path.join(dirpath, filename))
-                    if (input_path not in cache['files']) or os.path.getmtime(input_path) > cache['files'][input_path]['modified']:
-                        process(input_path)
-        
-        # After processing files, update the cache.
-        for source, global_scope in id_to_processed_file.values():
-            dependents = cache['files'][source.path]['dependents']
-            for dependent in source.dependents:
-                if dependent not in dependents:
-                    dependents.append(dependent.path)
+                    yield os.path.join(dirpath, filename)
 
-        with open(cachefilename, 'w+') as file:
-            file.write(json.dumps(cache, indent='  '))
+    source_paths = source_paths_in(args.source) if source_dest_are_dirs else (args.source,)
+    for source_path in source_paths:
+        # If the file has changed, process it:
+        input_path = normalize_path(os.path.relpath(source_path, '.'))
+        output_path : str
+        if source_dest_are_dirs:
+            input_relpath = os.path.relpath(source_path, args.source)
+            output_path = destination + '/' + input_relpath.removesuffix(syntax['src_extension']) + syntax['dest_extension']
+            output_path = normalize_path(os.path.relpath(output_path, '.'))
+        else: # destination is file:
+            output_path = normalize_path(os.path.relpath(destination, '.'))
+
+        is_dirty = (
+            (input_path not in cache['sources'])
+            or (output_path not in cache['sources'][input_path]['artifacts'])
+            or os.path.getmtime(input_path) > cache['sources'][input_path]['artifacts'][output_path]['modified']
+        )
+        if args.rebuild or is_dirty:
+            process(input_path, output_path)
+    
+    # After processing files, update dependencies in the cache.
+    for source, global_scope in id_to_processed_file.values():
+        dependents = cache['sources'][source.path]['dependents']
+        for dependent in source.dependents:
+            if dependent not in dependents:
+                dependents.append(dependent.path)
+
+    with open(cachefilename, 'w+') as file:
+        file.write(json.dumps(cache, indent='  '))
 
     print('\nDONE')

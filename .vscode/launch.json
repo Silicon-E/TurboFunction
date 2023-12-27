@@ -26,7 +26,7 @@
             "type": "python",
             "request": "launch",
             "program": "turbo_preprocess.py",
-            "args": ["\"${relativeFile}\""],
+            "args": ["--rebuild", "\"${relativeFile}\""],
             "console": "integratedTerminal",
             "justMyCode": true
         }
