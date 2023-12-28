@@ -69,7 +69,7 @@ Basics:
 ```
 ##define offset ~0 ~15.1 ~2
 ##define handle_entity(entity_id, particle)
-    execute at @e[type=%( entity_id )] run particle %( particle ) OFFSET
+    execute at @e[type=%( entity_id )] run particle %( particle ) %( offset )
 ##end
 %( handle_entity : creeper, block lime_wool )
 %( handle_entity : player,  instant_effect )
