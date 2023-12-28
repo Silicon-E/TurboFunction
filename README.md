@@ -19,12 +19,22 @@ Commands contain **code**. Code is transcluded into the output, with any embeds 
 
 ### Embeds
 
-All embeds begin with a `%(` and end with a closing `)`. Either bound can be escaped with a leading `\`. Embeds evaluate to some value. Each embed is either an **insertion** or an **invocation**. Insertions have the form:
-`%( symbol )`. Invocations have the form: `%( symbol : arg , arg , ... )`. `symbol` is code that must evaluate to a defined symbol. `arg` is code that may evaluate to any value. Code within embeds may contain other embeds.
+All embeds begin with a `%(` and end with a closing `)`. Embeds evaluate to some value. Each embed is either an **insertion** or an **invocation**. Insertions have the form:
+`%( symbol )`. Invocations have the form: `%( symbol : arg , arg , ... )`. `symbol` is code that must evaluate to a defined symbol. `arg` is code that may evaluate to any value. Surrounding whitespace is stripped from both, unless the code is wrapped with ` `` ` backticks. Code within embeds may contain other embeds.
 
 ### Code Blocks
 
 Some directives mark the beginning of code blocks. A code block is one of these directives, followed by any number of lines, followed by an `##end` directive. Code blocks can contain other code blocks. Lines inside a code block are used by the opening directive and are not transcluded into the containing scope.
+
+### Escape Characters
+
+Protected tokens can be escaped with a leading `\`. A `\` not followed by a protected token is transcluded into the output. Protected tokens are:
+- `%(`
+- `)`, if inside an embed.
+- Newline, if outside an embed.
+- `:`, if inside an embed's symbol section.
+- `,`, if inside an embed's arg section.
+- `\`, if followed by a non-`\` protected token.
 
 ## Directives
 
@@ -47,6 +57,8 @@ Defines one of two types of symbol: a **variable** or a **template**.
 > `name` - A valid symbol name.
 > 
 > `body` - Code. If defining a variable, the body is evaluated immediately. If defining a template, the template's argument symbols are in scope throughout the body.
+> 
+> In single-line form, surrounding whitespace is stripped unless the code is wrapped with ` `` ` backticks.
 
 If no argument list is given, defines a variable. When inserted, a variable evaluates to the value that its body evaluated to. Variables cannot be invoked.
 

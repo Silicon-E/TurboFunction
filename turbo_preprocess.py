@@ -223,6 +223,7 @@ pattern_rcurly  = re.compile(r'\}')
 pattern_rsquare = re.compile(r'\]')
 pattern_comma   = re.compile(r'\,')
 pattern_colon   = re.compile(r'\:')
+pattern_quote   = re.compile(r'`')
 pattern_directive_prefix = re.compile(f"{re.escape(syntax['directive_prefix'])}")
 pattern_embed_escape = re.compile(r'\\')
 pattern_embed_open         = re.compile(f"{re.escape(syntax['embed_open'])}")
@@ -413,12 +414,19 @@ class Code(list):
             if pattern_terminator and parser.peek(pattern_terminator):
                 break
             elif escape := parser.allow(pattern_embed_escape, strict=True):
-                current_str += escape
-                # Permit ONE protected token to follow the escape character.
-                if text := parser.allow(pattern_embed_open, strict=True):
+                protected_token_patterns = (pattern_embed_open, pattern_terminator)
+                if text := next((match for match in (parser.allow(pattern, strict=True) for pattern in protected_token_patterns) if match), None):
+                    # Permit ONE protected token to follow the escape character.
                     current_str += text
-                elif text := parser.allow(pattern_embed_close, strict=True):
-                    current_str += text
+                elif text := parser.allow(pattern_embed_escape, strict=True):
+                    # "\\" -> "\" only if followed by a protected token. Otherwise, "\\" -> "\\".
+                    if any(parser.peek(pattern) for pattern in protected_token_patterns):
+                        current_str += text
+                    else:
+                        current_str += escape + text
+                else:
+                    # If no protected token follows the escape, transclude the escape.
+                    current_str += escape
             elif parser.peek(pattern_embed_open):
                 if current_str:
                     result.append(current_str)
@@ -460,13 +468,21 @@ class Code(list):
 class ArgCode(Code):
     @staticmethod
     def parse(parser : Parser, pattern_terminator : re.Pattern):
-        result = Code.parse(parser, pattern_terminator)
-        # Strip surrounding whitespace.
-        if len(result) > 0:
-            if isinstance(result[0], str):
-                result[0] = result[0].lstrip()
-            if isinstance(result[-1], str):
-                result[-1] = result[-1].rstrip()
+        result : str
+        # Allow quoted argument code, which includes surrounding whitespace.
+        if parser.allow(pattern_quote):
+            result = Code.parse(parser, pattern_quote)
+
+            parser.expect(pattern_quote)
+        else:
+            result = Code.parse(parser, pattern_terminator)
+        
+            # Strip surrounding whitespace.
+            if len(result) > 0:
+                if isinstance(result[0], str):
+                    result[0] = result[0].lstrip()
+                if isinstance(result[-1], str):
+                    result[-1] = result[-1].rstrip()
         
         return result
 
@@ -514,7 +530,7 @@ class CommandDefine(Command):
         self.commands = None
         parser.allow(pattern_any_whitespace, strict=True)
         if parser.any(): # Symbol is defined in 1 line:
-            self.code = Code.parse(parser, pattern_newline)
+            self.code = ArgCode.parse(parser, pattern_newline)
             parser.allow(pattern_newline, strict=True)
         else: # No inline definition:
             self.commands = parse_block(lineparser)
@@ -524,7 +540,7 @@ class CommandDefine(Command):
         if self.arg_names is None:
             # Define a variable. Variables are evaluated now, when they are defined.
             value : str
-            if self.code:
+            if self.code is not None:
                 value = self.code.evaluate(scope)
             else:
                 assert self.commands is not None
@@ -537,7 +553,7 @@ class CommandDefine(Command):
         else:
             # Define a template. Templates are evaluated later, when they are invoked.
             commands : list[Command]
-            if self.code:
+            if self.code is not None:
                 commands = [CommandPlaintext(self.code)]
             else:
                 assert self.commands is not None
