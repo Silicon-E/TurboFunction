@@ -57,7 +57,7 @@ def canonize_path(path):
 def indent(string, indent):
     return ''.join(indent + line for line in string.splitlines(True))
 
-def path_to_id(root, path):
+def path_to_id(path, root):
     relpath = normalize_path(os.path.relpath(path, root))
     namespace = relpath.split('/', 1)[0]
     name = os.path.splitext(relpath)[0].removeprefix(f'{namespace}/functions/')
@@ -581,8 +581,9 @@ class CommandBlock(Command):
 
     def __init__(self, lineparser : FileParser, parser : Parser) -> None:
         parser.allow(pattern_any_whitespace, strict=True)
+        parser.allow(pattern_newline, strict=True)
         if parser.any():
-            raise ParserError(f"Expected nothing after {syntax['directive_prefix']}block but found: {parser.peek()}")
+            raise ParserError(f"Expected nothing after {syntax['directive_prefix']}block but found: {repr(parser.peek())}")
         
         self.condition_command = lineparser.next().strip(' \r\n\t')
         if not self.condition_command.removeprefix('$').startswith('execute '):
@@ -675,7 +676,7 @@ class CommandImport(Command):
         if self.namespace is not None:
             import_dirs = set((options.source_root)) | options.import_dirs
             import_relpath = f"{self.namespace}/functions/{self.name}{syntax['src_extension']}"
-        else:
+        else: # Local import. Currently impossible, because a namespace is required when parsing.
             import_dirs = set((os.path.dirname(source.path))) | options.import_dirs
             import_relpath = self.name + syntax['src_extension']
         import_paths = (f"{import_dir}/{import_relpath}" for import_dir in import_dirs)
@@ -795,6 +796,7 @@ def get_evaluated_source_and_target(input_path):
     return canon_path_to_source_and_target[input_path]
 get_evaluated_source_and_target.canon_path_to_source_and_target : dict[str, tuple[TurboFunction, MinecraftFunction]] = dict()
 
+canon_path_to_processed_source : dict[str, TurboFunction] = dict()
 def process(input_path, output_path):
     global cache
 
@@ -803,6 +805,8 @@ def process(input_path, output_path):
     source, target = get_evaluated_source_and_target(input_path)
 
     target.write()
+
+    canon_path_to_processed_source[canonize_path(input_path)] = source
     
     # Update the cache.
     cache_source = cache['sources'].get(input_path, CacheSource())
@@ -922,7 +926,7 @@ if __name__ == '__main__':
             process(input_path, output_path)
     
     # After processing files, update dependencies in the cache.
-    for source, target in get_evaluated_source_and_target.canon_path_to_source_and_target.values():
+    for source in canon_path_to_processed_source.values():
         dependents = cache['sources'][source.path]['dependents']
         for dependent in source.dependents:
             if dependent not in dependents:
