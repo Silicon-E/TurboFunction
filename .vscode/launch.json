@@ -13,7 +13,7 @@
             "justMyCode": true
         },
         {
-            "name": "Turbo Preprocess",
+            "name": "Turbo: Process all",
             "type": "python",
             "request": "launch",
             "program": "turbo_preprocess.py",
@@ -22,11 +22,20 @@
             "justMyCode": true
         },
         {
-            "name": "Turbo Preprocess current file",
+            "name": "Turbo: Process current file",
             "type": "python",
             "request": "launch",
             "program": "turbo_preprocess.py",
             "args": ["--rebuild", "\"${relativeFile}\""],
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Turbo: Debug current file",
+            "type": "python",
+            "request": "launch",
+            "program": "turbo_preprocess.py",
+            "args": ["--rebuild", "--verbose-parse", "\"${relativeFile}\""],
             "console": "integratedTerminal",
             "justMyCode": true
         }

@@ -50,9 +50,15 @@ def re_union(*patterns : re.Pattern):
 def normalize_path(path):
     return os.path.normpath(path).replace('\\', '/')
 
-def path_to_id(path):
-    path = normalize_path(path)
-    relpath = normalize_path(os.path.relpath(path, 'data'))
+def canonize_path(path):
+    "Transform a path to the form that uniquely identifies its resource relative to the working directory."
+    return normalize_path(os.path.relpath(path, '.'))
+
+def indent(string, indent):
+    return ''.join(indent + line for line in string.splitlines(True))
+
+def path_to_id(root, path):
+    relpath = normalize_path(os.path.relpath(path, root))
     namespace = relpath.split('/', 1)[0]
     name = os.path.splitext(relpath)[0].removeprefix(f'{namespace}/functions/')
     return (namespace, name)
@@ -60,9 +66,10 @@ def path_to_id(path):
 class TurboFunction:
     def __init__(self, path : str) -> None:
         self.path = path
-        (self.namespace, self.name) = path_to_id(path.removesuffix(syntax['src_extension']))
+        (self.namespace, self.name) = path_to_id(path, options.source_root)
         self.dependents : set[TurboFunction] = set()
         self.commands : list[Command] = []
+        self.global_scope = Scope()
 
     def id(self):
         return f'{self.namespace}:{self.id}'
@@ -70,7 +77,7 @@ class TurboFunction:
 class MinecraftFunction:
     def __init__(self, path : str, source : TurboFunction, parent : 'MinecraftFunction' = None) -> None:
         self.path = path
-        (self.namespace, self.name) = path_to_id(path.removesuffix(syntax['dest_extension']))
+        (self.namespace, self.name) = path_to_id(path, options.destination_root)
         self.source = source
         self.parent = parent
         self.anonymous_child_count = 0
@@ -513,6 +520,9 @@ class CommandComment(Command):
     def __init__(self, text : str) -> None:
         self.text = text
     
+    def __repr__(self) -> str:
+        return f"(CommandComment: {repr(self.text)})"
+    
     def output(self, scope : Scope, target : MinecraftFunction):
         target.lines.append(self.text)
 
@@ -528,13 +538,17 @@ class CommandDefine(Command):
 
         self.code = None
         self.commands = None
-        parser.allow(pattern_any_whitespace, strict=True)
+        parser.allow(pattern_newline)
         if parser.any(): # Symbol is defined in 1 line:
             self.code = ArgCode.parse(parser, pattern_newline)
             parser.allow(pattern_newline, strict=True)
         else: # No inline definition:
             self.commands = parse_block(lineparser)
     
+    def __repr__(self) -> str:
+        contents = repr(self.code) if self.code is not None else '\n'.join(['['] + [indent(',\n'.join(repr(command) for command in self.commands), '  ')] + [']'])
+        return f"(CommandDefine: {repr(self.name)}, {repr(self.arg_names)}, {contents})"
+
     def output(self, scope : Scope, target : MinecraftFunction):
         symbol : Symbol
         if self.arg_names is None:
@@ -575,6 +589,10 @@ class CommandBlock(Command):
             raise ParserError(f"The line following a {syntax['directive_prefix']}block must be a stub 'execute' command.")
         self.commands = parse_block(lineparser)
     
+    def __repr__(self) -> str:
+        contents = '\n'.join(['['] + [indent(',\n'.join(repr(command) for command in self.commands), '  ')] + [']'])
+        return f"(CommandBlock: {repr(self.condition_command)}, {contents})"
+
     def output(self, scope: Scope, target : MinecraftFunction):
         if CommandBlock.do_not_inline:
             pass
@@ -623,6 +641,10 @@ class CommandFunction(Command):
         if parser.any() and not parser.peek(pattern_newline):
             raise ParserError(f"Expected nothing after the function name, but found: {repr(parser.peek())}")
         self.commands = parse_block(lineparser)
+    
+    def __repr__(self) -> str:
+        contents = '\n'.join(['['] + [indent(',\n'.join(repr(command) for command in self.commands), '  ')] + [']'])
+        return f"(CommandBlock: {repr(self.name)}, {contents})"
 
     def output(self, scope: Scope, target : MinecraftFunction):
         inner_target = target.make_child(self.name.lower())
@@ -644,10 +666,29 @@ class CommandImport(Command):
         parser.expect(pattern_colon)
         self.name = parser.expect(re.compile(r'[^\r\n]+'))
     
-    def output(self, scope: Scope, target : MinecraftFunction):
-        (imported_compilation_unit, imported_scope) = get_processed_file((self.namespace, self.name))
-        imported_compilation_unit.dependents.add(source)
-        for name, symbol in imported_scope.all_symbols().items():
+    def __repr__(self) -> str:
+        return f"(CommandImport: {repr(self.namespace)}, {repr(self.name)})"
+    
+    def output(self, scope : Scope, target : MinecraftFunction):
+        import_dirs : set[str]
+        import_relpath : str
+        if self.namespace is not None:
+            import_dirs = set((options.source_root)) | options.import_dirs
+            import_relpath = f"{self.namespace}/functions/{self.name}{syntax['src_extension']}"
+        else:
+            import_dirs = set((os.path.dirname(source.path))) | options.import_dirs
+            import_relpath = self.name + syntax['src_extension']
+        import_paths = (f"{import_dir}/{import_relpath}" for import_dir in import_dirs)
+        extant_import_paths = [path for path in import_paths if os.path.isfile(path)]
+        if len(extant_import_paths) == 0:
+            raise ParserError(f"Couldn't find source file for import: {self.namespace}:{self.name} at any of:\n" + indent('\n'.join(import_paths), '  '))
+        if len(extant_import_paths) > 1:
+            raise ParserError(f"The import: {self.namespace}:{self.name} is ambiguous among:\n" + indent('\n'.join(extant_import_paths), '  '))
+        import_path = extant_import_paths[0]
+
+        imported_source, imported_target = get_evaluated_source_and_target(import_path)
+        imported_source.dependents.add(target.source)
+        for name, symbol in imported_source.global_scope.all_symbols().items():
             try:
                 scope.add_symbol(name, symbol)
             except ParserError as e:
@@ -699,59 +740,67 @@ def parse_block(lineparser : FileParser) -> list[Command]:
 ##################################################
 
 
-id_to_processed_file : dict[tuple[str, str], tuple[TurboFunction, Scope]] = dict()
-def get_processed_file(id : tuple[str]):
-    global id_to_processed_file
+def get_parsed_source(input_path):
+    canon_path_to_source : dict[str, TurboFunction] = get_parsed_source.canon_path_to_source
 
-    if id not in id_to_processed_file:
-        (namespace, name) = id
-        input_path  = f'data/{namespace}/functions/{name}{syntax["src_extension"]}'
-        output_path = f'data/{namespace}/functions/{name}{syntax["dest_extension"]}'
-        if not os.path.exists(input_path):
-            raise ParserError(f"Function {namespace}:{name} does not exist at path: {input_path}")
+    input_path = canonize_path(input_path)
 
+    if input_path not in canon_path_to_source:
         source = TurboFunction(input_path)
         input_lines = []
         with open(input_path) as file:
             input_lines = file.readlines()
         lineparser = FileParser(input_lines)
 
-        try:
-            while lineparser.any():
-                source.commands.append(parse_command(lineparser))
-        except ParserError as err:
-            log_error(lineparser, None, err)
+        while lineparser.any():
+            try:
+                command = parse_command(lineparser)
+                if isinstance(command, CommandEnd):
+                    raise ParserError(f"Found an unmatched {syntax['directive_prefix']}end directive.")
+                source.commands.append(command)
+            except ParserError as err:
+                log_error(lineparser, None, err)
         
-        if verbose_parse:
+        if options.verbose_parse:
             for command in source.commands:
                 print(repr(command))
-
-        global_scope = Scope()
-
         
-        id_to_processed_file[id] = (source, global_scope)
+        canon_path_to_source[input_path] = source
 
-    return id_to_processed_file[id]
+    return canon_path_to_source[input_path]
+get_parsed_source.canon_path_to_source : dict[str, TurboFunction] = dict()
+
+def get_evaluated_source_and_target(input_path):
+    canon_path_to_source_and_target : dict[str, tuple[TurboFunction, MinecraftFunction]] = get_evaluated_source_and_target.canon_path_to_source_and_target
+
+    input_path = canonize_path(input_path)
+
+    if input_path not in canon_path_to_source_and_target:
+        source = get_parsed_source(input_path)
+        
+        target = MinecraftFunction(output_path, source)
+        target.lines = output_file_header(target)
+
+        for index, command in enumerate(source.commands):
+            try:
+                command.output(source.global_scope, target)
+            except ParserError as err:
+                if err.pos == None:
+                    err.pos = (-1,-1)
+                err.pos = (index+1, err.pos[1])
+                log_error(None, None, err)
+
+        canon_path_to_source_and_target[input_path] = (source, target)
+
+    return canon_path_to_source_and_target[input_path]
+get_evaluated_source_and_target.canon_path_to_source_and_target : dict[str, tuple[TurboFunction, MinecraftFunction]] = dict()
 
 def process(input_path, output_path):
     global cache
 
     print(f'Processing {input_path}...')
     # Imports can cause sources to be processed before they're iterated over in the source directory. get_processed_file() handles this.
-    id = path_to_id(input_path.removesuffix(syntax['src_extension']))
-    (source, global_scope) = get_processed_file(id)
-    
-    target = MinecraftFunction(output_path, source)
-    target.lines = output_file_header(target)
-
-    for index, command in enumerate(source.commands):
-        try:
-            command.output(global_scope, target)
-        except ParserError as err:
-            if err.pos == None:
-                err.pos = (-1,-1)
-            err.pos = (index+1, err.pos[1])
-            log_error(None, None, err)
+    source, target = get_evaluated_source_and_target(input_path)
 
     target.write()
     
@@ -780,30 +829,53 @@ def Cache():
     }
 
 cache = Cache()
-verbose_parse : bool = False
+
+@dataclass
+class Options:
+    verbose_parse : bool = False
+    import_dirs : set[str] = field(default_factory=set)
+    source_root      : str = 'data/'
+    destination_root : str = 'data/'
+
+options = Options()
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser(description=__doc__)
     argparser.add_argument('--syntax', required=False, help="The path of a .json file defining alternate source syntax.")
     argparser.add_argument('--verbose-parse', required=False, action='store_true', help="Print each syntax tree as it is parsed. Defaults to True if 'source' is a file.")
     argparser.add_argument('--rebuild', required=False, action='store_true', help="Process each source file, even if it is up-to-date.")
+    argparser.add_argument('--source-root', required=False, help="The data/ folder of the source datapack. Defaults to 'source' if it's a directory, or to data/ otherwise.")
+    argparser.add_argument('--destination-root', required=False, help="The data/ folder of the destination datapack. Defaults to 'destination' if it's a directory, or to data/ otherwise.")
     argparser.add_argument('source',      nargs='?', default='data/', help="The path to a source file or directory containing source files.")
     argparser.add_argument('destination', nargs='?',                  help="The path under which to output .mcfunction files, or the path at which to create a single .mcfunction file. Defaults to outputting alongside source files.")
+    argparser.add_argument('--import-dirs', nargs='+', default=['data/'], help="One or more paths under which 'import' directives will search for source files. Namespaced imports are resovled as if an import directory is the data/ directory of a datapack.")
     args = argparser.parse_args()
 
-    verbose_parse = args.verbose_parse
+    # Custom defaults:
     source_dest_are_dirs = os.path.isdir(args.source)
-    destination : str
+    # if args.import_dirs is None:
+    #     # Defaults to 'source' if it's a directory, or to data/ if it's a file.
+    #     args.import_dirs = args.source if source_dest_are_dirs else 'data/'
     if args.destination is not None:
-        destination = args.destination
+        args.destination = args.destination
     else:
         if source_dest_are_dirs:
-            destination = args.source
+            args.destination = args.source
         else:
-            destination = args.source.removesuffix(syntax['src_extension']) + syntax['dest_extension']
+            args.destination = args.source.removesuffix(syntax['src_extension']) + syntax['dest_extension']
 
-    if source_dest_are_dirs and not os.path.isdir(destination):
-        raise ValueError(f"When 'source' is a directory like {args.source}, 'destination' must also be an existing directory, but instead it was: {destination}")
+    args.source_root      = args.source_root      or (args.source      if source_dest_are_dirs else 'data/')
+    args.destination_root = args.destination_root or (args.destination if source_dest_are_dirs else 'data/')
+
+    # Validate args.
+    if source_dest_are_dirs and not os.path.isdir(args.destination):
+        raise ValueError(f"When 'source' is a directory like {args.source}, 'destination' must also be an existing directory, but instead it was: {args.destination}")
+    
+    # Set options.
+    options.verbose_parse = args.verbose_parse
+    options.import_dirs = set(args.import_dirs)
+    options.source_root = args.source_root
+    options.destination_root = args.destination_root
 
     if args.syntax:
         with open(args.syntax, 'r') as syntax_file:
@@ -832,14 +904,14 @@ if __name__ == '__main__':
     source_paths = source_paths_in(args.source) if source_dest_are_dirs else (args.source,)
     for source_path in source_paths:
         # If the file has changed, process it:
-        input_path = normalize_path(os.path.relpath(source_path, '.'))
+        input_path = canonize_path(source_path)
         output_path : str
         if source_dest_are_dirs:
             input_relpath = os.path.relpath(source_path, args.source)
-            output_path = destination + '/' + input_relpath.removesuffix(syntax['src_extension']) + syntax['dest_extension']
-            output_path = normalize_path(os.path.relpath(output_path, '.'))
+            output_path = args.destination + '/' + input_relpath.removesuffix(syntax['src_extension']) + syntax['dest_extension']
+            output_path = canonize_path(output_path)
         else: # destination is file:
-            output_path = normalize_path(os.path.relpath(destination, '.'))
+            output_path = canonize_path(args.destination)
 
         is_dirty = (
             (input_path not in cache['sources'])
@@ -850,7 +922,7 @@ if __name__ == '__main__':
             process(input_path, output_path)
     
     # After processing files, update dependencies in the cache.
-    for source, global_scope in id_to_processed_file.values():
+    for source, target in get_evaluated_source_and_target.canon_path_to_source_and_target.values():
         dependents = cache['sources'][source.path]['dependents']
         for dependent in source.dependents:
             if dependent not in dependents:
