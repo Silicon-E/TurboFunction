@@ -146,18 +146,18 @@ scoreboard players set #reach num 5
 function %( loop )
 ```
 
-### ##include
+### ##import
 
 Defines all the symbols that are defined in the top-level scope of another source file.
 
 > ```
-> ##include <source>
+> ##import <source>
 > ```
-> `source` - The namespaced ID of the source file to include symbols from
+> `source` - The namespaced ID of the source file to import symbols from
 
 #### Example
 
 ```
-##include turbopreprocess:num
+##import turbopreprocess:num
 %( op : #foo num = @s num )
 ```
