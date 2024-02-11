@@ -37,7 +37,7 @@ optional arguments:
 syntax = {
     'src_extension': ' SRC.mcfunction',
     'dest_extension': '.mcfunction',
-    'directive_prefix': '##',
+    'directive_prefix': '%%',
     'embed_open': '%(',
     'embed_close': ')',
 }
@@ -162,7 +162,7 @@ class SymbolTemplate(Symbol):
 
     def invoke(self, args: list):
         if len(args) != len(self.argnames):
-            raise ParserError(f"Template {self.name} expected {len(self.argnames)} arguments, but got {len(args)}: {repr(args)}")
+            raise ParserError(f"Template expected {len(self.argnames)} arguments, but got {len(args)}: {repr(args)}")
         
         inner_scope = Scope(self.parent_scope)
         for i, argname in enumerate(self.argnames):
@@ -559,10 +559,12 @@ class CommandDefine(Command):
             else:
                 assert self.commands is not None
 
-                inner_lines : list[str] = []
+                inner_scope = Scope(scope)
+
+                inner_target = target.make_child()
                 for command in self.commands:
-                    command.output(scope, inner_lines)
-                value = '\n'.join(inner_lines)
+                    command.output(inner_scope, inner_target)
+                value = '\n'.join(inner_target.lines)
             symbol = SymbolVariable(value)
         else:
             # Define a template. Templates are evaluated later, when they are invoked.
@@ -855,6 +857,13 @@ if __name__ == '__main__':
     argparser.add_argument('--import-dirs', nargs='+', default=['data/'], help="One or more paths under which 'import' directives will search for source files. Namespaced imports are resovled as if an import directory is the data/ directory of a datapack.")
     args = argparser.parse_args()
 
+    # FIRST, load custom syntax. This may affect file paths, because preferred file extensions may be different.
+    if args.syntax:
+        with open(args.syntax, 'r') as syntax_file:
+            alt_syntax = json.load(syntax_file)
+            for key, value in alt_syntax.items():
+                syntax[key] = value
+    
     # Custom defaults:
     source_dest_are_dirs = os.path.isdir(args.source)
     # if args.import_dirs is None:
@@ -880,12 +889,6 @@ if __name__ == '__main__':
     options.import_dirs = set(args.import_dirs)
     options.source_root = args.source_root
     options.destination_root = args.destination_root
-
-    if args.syntax:
-        with open(args.syntax, 'r') as syntax_file:
-            alt_syntax = json.load(syntax_file)
-            for key, value in alt_syntax.items():
-                syntax[key] = value
 
     # Load the cache from disk. Create a new cache if it's missing or using a different version.
     cachefilename = 'turbo_cache.json'
