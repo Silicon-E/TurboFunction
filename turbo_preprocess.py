@@ -587,9 +587,7 @@ class CommandBlock(Command):
         if parser.any():
             raise ParserError(f"Expected nothing after {syntax['directive_prefix']}block but found: {repr(parser.peek())}")
         
-        self.condition_command = lineparser.next().strip(' \r\n\t')
-        if not self.condition_command.removeprefix('$').startswith('execute '):
-            raise ParserError(f"The line following a {syntax['directive_prefix']}block must be a stub 'execute' command.")
+        self.condition_command = CommandPlaintext.parse(Parser(lineparser.next().strip(' \r\n\t')))
         self.commands = parse_block(lineparser)
     
     def __repr__(self) -> str:
@@ -597,6 +595,12 @@ class CommandBlock(Command):
         return f"(CommandBlock: {repr(self.condition_command)}, {contents})"
 
     def output(self, scope: Scope, target : MinecraftFunction):
+        condition_text = self.condition_command.code.evaluate(scope)
+        if not isinstance(condition_text, str):
+            raise ParserError(f"The line following a {syntax['directive_prefix']}block must evaluate to a string, but got: {repr(condition_text)}")
+        if not condition_text.removeprefix('$').startswith('execute '):
+            raise ParserError(f"The line following a {syntax['directive_prefix']}block must be a stub 'execute' command.")
+    
         if CommandBlock.do_not_inline:
             pass
 
@@ -607,7 +611,7 @@ class CommandBlock(Command):
                     line = command.code.evaluate(scope)
                     line = line.lstrip(' \r\n\t')
                     if not line.startswith('#'):
-                        condition = self.condition_command
+                        condition = condition_text
                         if line.startswith('execute'):
                             line = line.removeprefix('execute')
                         else:
@@ -631,7 +635,7 @@ class CommandBlock(Command):
             inner_target.write()
 
             CommandPlaintext(
-                Code([ f'{self.condition_command} run function {inner_target.id()}\n' ])
+                Code([ f'{condition_text} run function {inner_target.id()}\n' ])
             ).output(scope, target)
         else:
             for command in self.commands:
