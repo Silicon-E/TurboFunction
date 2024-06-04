@@ -417,6 +417,13 @@ class Code(list):
     def parse(parser : Parser, pattern_terminator : re.Pattern):
         result = Code()
         current_str = ''
+        def push_current_string():
+            nonlocal current_str
+            nonlocal result
+            if current_str:
+                result.append(current_str)
+                current_str = ''
+
         while parser.any():
             if pattern_terminator and parser.peek(pattern_terminator):
                 break
@@ -435,18 +442,12 @@ class Code(list):
                     # If no protected token follows the escape, transclude the escape.
                     current_str += escape
             elif parser.peek(pattern_embed_open):
-                if current_str:
-                    result.append(current_str)
-                    current_str = ''
-                
+                push_current_string()
                 result.append(Embed.parse(parser))
             else:
                 current_str += parser.expect(pattern_not_newline, strict=True)
         
-        if current_str:
-            result.append(current_str)
-            current_str = ''
-        
+        push_current_string()
         return result
 
     def evaluate(self, scope : Scope):
@@ -483,6 +484,10 @@ class ArgCode(Code):
             parser.expect(pattern_quote)
         else:
             result = Code.parse(parser, pattern_terminator)
+            
+            # An empty Code not surrounded by quotes is not a valid ArgCode:
+            if len(result) == 0:
+                return None
         
             # Strip surrounding whitespace.
             if len(result) > 0:
@@ -490,7 +495,7 @@ class ArgCode(Code):
                     result[0] = result[0].lstrip()
                 if isinstance(result[-1], str):
                     result[-1] = result[-1].rstrip()
-        
+
         return result
 
 class Command:
@@ -533,7 +538,7 @@ class CommandDefine(Command):
 
         self.arg_names = None
         if parser.allow(pattern_lparen):
-            self.arg_names = parse_sequence(parser, lambda prsr: prsr.expect(pattern_name), pattern_comma)
+            self.arg_names = parse_sequence(parser, lambda prsr: prsr.allow(pattern_name), pattern_comma)
             parser.expect(pattern_rparen)
 
         self.code = None
