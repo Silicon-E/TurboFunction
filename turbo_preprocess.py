@@ -685,12 +685,12 @@ class CommandImport(Command):
         import_dirs : set[str]
         import_relpath : str
         if self.namespace is not None:
-            import_dirs = set((options.source_root)) | options.import_dirs
+            import_dirs = {options.source_root} | options.import_dirs
             import_relpath = f"{self.namespace}/functions/{self.name}{syntax['src_extension']}"
         else: # Local import. Currently impossible, because a namespace is required when parsing.
-            import_dirs = set((os.path.dirname(source.path))) | options.import_dirs
+            import_dirs = {os.path.dirname(source.path)} | options.import_dirs
             import_relpath = self.name + syntax['src_extension']
-        import_paths = (f"{import_dir}/{import_relpath}" for import_dir in import_dirs)
+        import_paths = [f"{import_dir}/{import_relpath}" for import_dir in import_dirs]
         extant_import_paths = [path for path in import_paths if os.path.isfile(path)]
         if len(extant_import_paths) == 0:
             raise ParserError(f"Couldn't find source file for import: {self.namespace}:{self.name} at any of:\n" + indent('\n'.join(import_paths), '  '))
