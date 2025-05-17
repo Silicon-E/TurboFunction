@@ -26,8 +26,10 @@ optional arguments:
 
 
 #   TODO
+# Name child Targets based on line number in the source file.
+# Don't update the cached modified time for a source if it built with errors.
+# Move path_to_id(), options.source_root, options.destination_root to be part of Workspace.
 # Allow the 'filename' arg to specify a source DIRECTORY, which defaults to ./data/ .
-# Add an arg for a dest directory, which defaults to the source directory.
 # Rebuild all when this python script changes.
 # Test if working:  Rebuild dependee functions when a dependency function changes.
 # Add --clean option.
@@ -752,7 +754,7 @@ def parse_block(lineparser : FileParser) -> list[Command]:
 ##################################################
 
 
-def get_parsed_source(input_path):
+def get_parsed_source(input_path : str) -> TurboFunction:
     canon_path_to_source : dict[str, TurboFunction] = get_parsed_source.canon_path_to_source
 
     input_path = canonize_path(input_path)
@@ -790,6 +792,7 @@ def get_evaluated_source_and_target(input_path):
     if input_path not in canon_path_to_source_and_target:
         source = get_parsed_source(input_path)
         
+        output_path = workspace.source_path_to_destination_path(input_path)
         target = MinecraftFunction(output_path, source)
         target.lines = output_file_header(target)
 
@@ -808,7 +811,7 @@ def get_evaluated_source_and_target(input_path):
 get_evaluated_source_and_target.canon_path_to_source_and_target : dict[str, tuple[TurboFunction, MinecraftFunction]] = dict()
 
 canon_path_to_processed_source : dict[str, TurboFunction] = dict()
-def process(input_path, output_path):
+def process(input_path):
     global cache
 
     print(f'Processing {input_path}...')
@@ -852,7 +855,22 @@ class Options:
     source_root      : str = 'data/'
     destination_root : str = 'data/'
 
+class Workspace:
+    def __init__(self, source, destination ):
+        self.source = source
+        self.destination = destination
+        self.source_dest_are_dirs = os.path.isdir(source)
+
+    def source_path_to_destination_path(self, input_path : str) -> str:
+        if self.source_dest_are_dirs:
+            input_relpath = os.path.relpath(input_path, self.source)
+            output_path = self.destination + '/' + input_relpath.removesuffix(syntax['src_extension']) + syntax['dest_extension']
+            return canonize_path(output_path)
+        else: # destination is file:
+            return canonize_path(self.destination)
+
 options = Options()
+workspace : Workspace
 
 if __name__ == '__main__':
     argparser = argparse.ArgumentParser(description=__doc__)
@@ -899,6 +917,8 @@ if __name__ == '__main__':
     options.source_root = args.source_root
     options.destination_root = args.destination_root
 
+    workspace = Workspace(args.source, args.destination)
+
     # Load the cache from disk. Create a new cache if it's missing or using a different version.
     cachefilename = 'turbo_cache.json'
     if os.path.isfile(cachefilename):
@@ -921,13 +941,7 @@ if __name__ == '__main__':
     for source_path in source_paths:
         # If the file has changed, process it:
         input_path = canonize_path(source_path)
-        output_path : str
-        if source_dest_are_dirs:
-            input_relpath = os.path.relpath(source_path, args.source)
-            output_path = args.destination + '/' + input_relpath.removesuffix(syntax['src_extension']) + syntax['dest_extension']
-            output_path = canonize_path(output_path)
-        else: # destination is file:
-            output_path = canonize_path(args.destination)
+        output_path = workspace.source_path_to_destination_path(input_path)
 
         is_dirty = (
             (input_path not in cache['sources'])
@@ -935,7 +949,7 @@ if __name__ == '__main__':
             or os.path.getmtime(input_path) > cache['sources'][input_path]['artifacts'][output_path]['modified']
         )
         if args.rebuild or is_dirty:
-            process(input_path, output_path)
+            process(input_path)
     
     # After processing files, update dependencies in the cache.
     for source in canon_path_to_processed_source.values():
